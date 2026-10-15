@@ -53,6 +53,10 @@ const categories = categoriesRaw as RawCategory[]
 export const ERA_ID_TO_INDEX = new Map(eras.map((e, i) => [e.id, i]))
 export const CATEGORY_ID_TO_INDEX = new Map(categories.map((c, i) => [c.id, i]))
 
+// ───── 反向：数字索引 → 字符串 id（社区层与 data/*.json 之间序列化时要还原成 id） ─────
+export const ERA_IDS = eras.map(e => e.id)
+export const CATEGORY_IDS = categories.map(c => c.id)
+
 /** 渲染管线使用的节点结构（era/category 已转为索引，name 已做缺失回退） */
 export interface TechNode {
   id: string

@@ -11,12 +11,22 @@ import { CameraRig } from './controls'
 import { TourPlan, BLEND } from './tour'
 import { buildGraph, kHopDepth, type DepGraph } from './graph'
 import { loadEdits, saveEdits, clearEdits, emptyEdits, applyEdits, hasEdits, newTechId, type UserEdits } from './edit'
+import { COMMUNITY_ENABLED } from './community/config'
 
 // 点击聚焦沿"画面上真实存在的弧线"走 1 跳：只留直接相连的上下游，配合相机取景把这一组放到画面里
 const FOCUS_HOPS = 1
 
 // ───── 世界状态：数据（基础 + 用户增删）→ 布局 → 场景内容。增删后由 rebuildWorld() 整体重建 ─────
 let edits: UserEdits = loadEdits()
+// 社区层（Supabase）。未配置后端时 COMMUNITY_ENABLED=false，相关调用全部短路，
+// 行为与纯本地版本完全一致
+let communityEdits: UserEdits = emptyEdits()
+let communityIds: Set<string> = new Set()
+// 社区贡献的节点 id（新增 / 被改过的条目），"一键隐藏社区层"隐藏的就是这一批
+let communityNodeIds: Set<string> = new Set()
+let hiddenCommunity = false
+// 社区上报入口。未配置后端时恒为 null，所有 push* 调用都是空操作
+let communityApi: typeof import('./community/client') | null = null
 let techs!: TechNode[]
 let placed!: PlacedNode[]
 let graph!: DepGraph
@@ -70,6 +80,23 @@ function disposeObjects(objs: THREE.Object3D[], disposeGeometry = true) {
 }
 
 /**
+ * 本地叠加层 + 社区叠加层的合并规则：
+ * - added 按 id 去重（社区优先，免得同一次新增被本地与远端各算一份）
+ * - deleted / colors 取并集
+ * 社区层为空时直接返回本地层，纯本地路径不额外付出任何代价
+ */
+function combineOverlay(local: UserEdits, remote: UserEdits): UserEdits {
+  if (!hasEdits(remote)) return local
+  if (!hasEdits(local)) return remote
+  const remoteIds = new Set(remote.added.map(n => n.id))
+  return {
+    added: [...local.added.filter(n => !remoteIds.has(n.id)), ...remote.added],
+    deleted: [...new Set([...local.deleted, ...remote.deleted])],
+    colors: { ...local.colors, ...remote.colors },
+  }
+}
+
+/**
  * 按当前 techs 重建全部世界内容：布局、依赖图、多面体、环、名称、时代名、连线、漫游排期。
  * 新增/删除节点后调用，是"数据变了画面就跟着变"的唯一入口。
  */
@@ -80,7 +107,7 @@ function buildWorld() {
   disposeObjects(eraLabels ? eraLabels.meshes : [])
   if (edges) disposeObjects([edges.lines])
 
-  techs = applyEdits(TECHS, edits)
+  techs = applyEdits(TECHS, combineOverlay(edits, communityEdits))
   const layout = layoutTower(techs)
   placed = layout.placed
   eraRadii = layout.eraRadii
@@ -232,7 +259,8 @@ function applyVisualState() {
     const n = placed[i].node
     nodeVis[i] = !hiddenCats.has(n.category) &&
       (!kindsOn || activeKinds.has(n.kind)) &&
-      (soloImp === null || n.importance === soloImp) ? 1 : 0
+      (soloImp === null || n.importance === soloImp) &&
+      !(hiddenCommunity && communityNodeIds.has(n.id)) ? 1 : 0
   }
   // 选中项所属领域被隐藏时聚焦自动失效
   if (selected !== null && !nodeVis[selected]) { selected = null; focusDepth = null }
@@ -303,6 +331,25 @@ rig.onEraChange = era => {
 // ───── UI：工具栏 ─────
 const btnTour = document.getElementById('btnTour') as HTMLButtonElement
 const btnReset = document.getElementById('btnReset') as HTMLButtonElement
+const btnCommunity = document.getElementById('btnCommunity') as HTMLButtonElement
+
+// ───── 社区层开关：一键隐藏 / 显示社区贡献的节点（连带其连线与名称） ─────
+/** 没有社区节点时整颗按钮不出现，纯本地版本不会多出一个永远点不动的按钮 */
+function syncCommunityButton() {
+  const n = communityNodeIds.size
+  if (n === 0 && hiddenCommunity) hiddenCommunity = false // 社区层空了，开关自动复位
+  btnCommunity.classList.toggle('hidden', n === 0)
+  btnCommunity.classList.toggle('active', hiddenCommunity)
+  btnCommunity.textContent = hiddenCommunity ? `👥 社区层已隐藏 (${n})` : `👥 隐藏社区层 (${n})`
+  btnCommunity.title = hiddenCommunity
+    ? '重新显示社区贡献的节点'
+    : '只显示调研基线，藏起社区新增 / 修改过的节点'
+}
+btnCommunity.addEventListener('click', () => {
+  hiddenCommunity = !hiddenCommunity
+  syncCommunityButton()
+  applyVisualState()
+})
 
 // 漫游期间只保留时代名与科技名：其余界面与悬停让位，连线改为按显现时刻生长
 const BASE_FOV = camera.fov
@@ -522,7 +569,7 @@ function tooltipHTML(idx: number, pinned: boolean): string {
        ${n.color ? `<button data-act="uncolor">↺ 恢复领域色</button>` : ''}`
     : ''
   return `
-    <div class="tt-name">${esc(n.name)}</div>
+    <div class="tt-name">${esc(n.name)}${communityIds.has(n.id) ? '<span class="tt-comm">社区</span>' : ''}</div>
     <div class="tt-dim">${n.nameEn !== n.name ? esc(n.nameEn) + ' · ' : ''}${yearText(n)}</div>
     <div class="tt-dim">${ERA_INFO[n.era].name} · ${CATEGORY_NAMES[n.category]}${n.kind ? ' · ' + esc(n.kind) : ''}</div>
     <div class="tt-dim">重要度 ${'★'.repeat(6 - n.importance)}${'☆'.repeat(n.importance - 1)}　${facesOf(n.importance)} 面</div>
@@ -771,6 +818,7 @@ function setNodeColor(id: string, hex: string | null) {
   if (hex) edits.colors[id] = hex
   else delete edits.colors[id]
   saveEdits(edits)
+  if (communityApi) void communityApi.pushColor(id, hex) // 社区层同步记一笔
   const idx = placedByIdx.get(id)
   if (idx === undefined) return
   const node = placed[idx].node
@@ -813,6 +861,7 @@ function deleteNode(id: string) {
   delete edits.colors[id] // 节点都没了，自定义色一并清掉
   if (prereqId === id) pickPrereq(null)
   saveEdits(edits)
+  if (communityApi) void communityApi.pushDelete(id) // 社区层同步记一笔（核心节点会被服务端拒掉）
   hidePinnedTooltip()
   rebuildAfterDataChange(null)
 }
@@ -844,6 +893,7 @@ document.getElementById('edAdd')!.addEventListener('click', () => {
   // 自定义色与新增节点一样只记在叠加层：color 缺省即跟随领域
   if (!edColorAuto.checked) edits.colors[id] = edColor.value
   saveEdits(edits)
+  if (communityApi) void communityApi.pushAdd(node) // 社区层同步记一笔
   edName.value = ''
   edNameEn.value = ''
   edDesc.value = ''
@@ -871,6 +921,7 @@ function refreshInterface() {
     ? `已添加 ${edits.added.length} 项 · 已删除 ${edits.deleted.length} 项 · 改色 ${Object.keys(edits.colors).length} 项`
     : '当前为调研原始数据'
   edCount.classList.toggle('dirty', hasEdits(edits))
+  syncCommunityButton()
 }
 
 /** 增删之后：重建世界 → 让相机认新布局 → 清残留状态 → 重新下发掩码 */
@@ -894,6 +945,35 @@ function rebuildAfterDataChange(focusId: string | null) {
     if (idx !== undefined) selectNode(idx)
   }
 }
+
+// ───── 社区层接线（Supabase）─────
+// 只有配好 src/community/config.ts 里的 URL + anon key 才会真正加载 src/community；
+// 没配时 COMMUNITY_ENABLED=false，communityApi 恒为 null，所有上报/订阅都是空操作。
+
+/** 重拉社区层并重建画面。网络异常时保留上一次的社区层，不把画面清空 */
+async function refreshCommunity() {
+  if (!communityApi) return
+  const st = await communityApi.fetchCommunity()
+  if (!st.ok) return
+  communityEdits = st.edits
+  communityIds = st.communityIds
+  communityNodeIds = st.nodeIds
+  rebuildAfterDataChange(null)
+}
+
+async function loadCommunity() {
+  try {
+    const m = await import('./community/client')
+    communityApi = m
+    // 订阅放在首次拉取之前：万一拉取与首帧之间有人写入，事件到了照样会再拉一次
+    m.subscribe(() => { void refreshCommunity() })
+  } catch (e) {
+    console.warn('[community] 模块加载失败，退回纯本地', e)
+    return
+  }
+  await refreshCommunity()
+}
+if (COMMUNITY_ENABLED) void loadCommunity()
 
 // ───── 自适应窗口 ─────
 function refreshView() {

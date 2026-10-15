@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#05070f" />
+  <!-- 管理页不该被搜索引擎收录 -->
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" href="data:," />
+  <title>管理端 · 人类科技树社区编辑</title>
+</head>
+<body>
+  <div id="adm">
+    <header>
+      <h1>社区编辑 · 管理端</h1>
+      <a href="../">← 回到科技树</a>
+    </header>
+
+    <div class="bar">
+      <label class="sec">
+        <span>ADMIN_SECRET</span>
+        <input id="admSecret" type="password" placeholder="粘贴你的管理密钥" autocomplete="off" />
+      </label>
+      <button id="admConnect">连接</button>
+      <span id="admState" class="state"></span>
+    </div>
+
+    <p id="admHint" class="hint"></p>
+
+    <div id="admToolbar" class="bar hidden">
+      <button id="admPaused">⏸ 暂停社区写入</button>
+      <label class="sec">
+        <span>回退到</span>
+        <input id="admSince" type="datetime-local" />
+      </label>
+      <button id="admRollbackSince">⟲ 回退该时刻之后的改动</button>
+      <button id="admReset" class="danger">⚠ 全局重置</button>
+      <span id="admCount" class="count"></span>
+    </div>
+
+    <table id="admTable" class="hidden">
+      <thead>
+        <tr>
+          <th>#</th><th>时间</th><th>操作</th><th>对象</th><th>内容</th><th>作者</th><th>处置</th>
+        </tr>
+      </thead>
+      <tbody id="admRows"></tbody>
+    </table>
+
+    <p class="foot">
+      回退 = 从 append-only 日志里删掉对应记录，画面立刻回到改动前的状态。
+      密钥只存在本页标签页的 sessionStorage 里，关掉即失效，不进构建产物。
+    </p>
+  </div>
+
+  <script type="module" src="../src/admin.ts"></script>
+</body>
+</html>

@@ -316,6 +316,18 @@ body {
 }
 #tooltip.show { opacity: 1; }
 #tooltip .tt-name { font-size: 14px; font-weight: bold; color: #fff; }
+/* 社区层来源标记：这条节点/改色由社区贡献，不是调研基线 */
+#tooltip .tt-comm {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: normal;
+  vertical-align: 1px;
+  color: #cfe3ff;
+  background: rgba(90, 140, 255, 0.22);
+  border: 1px solid rgba(90, 140, 255, 0.5);
+}
 #tooltip .tt-dim { opacity: 0.65; }
 #tooltip .tt-desc {
   max-width: 300px;

@@ -1,0 +1,12 @@
+# Supabase 项目配置（由 link 关联，手写维护）
+project_id = "bajnkublgrrlqnoarchv"
+
+# admin 函数用自己的 x-admin-secret 鉴权，前端不带 Supabase JWT；
+# 网关默认的 JWT 校验会在进入函数代码之前就把请求 401 掉，必须关掉。
+# 安全性不降级：函数内部仍会逐字符比对 ADMIN_SECRET。
+[functions.admin]
+verify_jwt = false
+
+# write 函数保持默认（前端带 anon key，正好过网关校验）
+[functions.write]
+verify_jwt = true
