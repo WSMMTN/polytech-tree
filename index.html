@@ -56,7 +56,19 @@
       </div>
       <label class="ed-f"><span>年代（负数为公元前）</span>
         <input id="edYear" type="number" value="1900" step="1" /></label>
-      <label class="ed-f"><span>前置科技</span><select id="edPrereq"><option value="">（展开后可搜索选择）</option></select></label>
+      <div class="ed-f"><span>前置科技</span>
+        <div class="ed-combo">
+          <input id="edPrereq" type="text" placeholder="输入名称 / 英文名 / 别名搜索" autocomplete="off" />
+          <button id="edPrereqClear" class="ed-combo-x" type="button" title="清空前置">✕</button>
+          <div id="edPrereqList" class="ed-combo-list"></div>
+        </div>
+      </div>
+      <label class="ed-f"><span>颜色</span>
+        <div class="ed-color">
+          <input id="edColor" type="color" value="#5a8cff" title="自定义颜色" />
+          <label class="ed-color-auto"><input id="edColorAuto" type="checkbox" checked />跟随领域色</label>
+        </div>
+      </label>
       <label class="ed-f"><span>简介</span>
         <textarea id="edDesc" rows="2" placeholder="可选"></textarea></label>
     </div>
@@ -64,7 +76,7 @@
       <button id="edAdd" class="ed-primary">＋ 添加科技</button>
       <button id="edRestore">↺ 恢复默认数据</button>
     </div>
-    <div class="ed-hint">增删只存在本机（localStorage），不改动仓库数据；删除请点节点卡片里的「🗑 删除此节点」</div>
+    <div class="ed-hint">增删与改色只存在本机（localStorage），不改动仓库数据；删除 / 改色请点节点卡片里的按钮</div>
   </div>
 
   <div id="hint">拖拽旋转 · 滚轮缩放 · 右键平移 · 悬停查看信息 · 点击节点只留直接相连（一跳）的科技（再点或 Esc 取消）· 漫游中按 Esc 退出</div>

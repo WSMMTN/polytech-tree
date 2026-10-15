@@ -7,9 +7,11 @@ const KEY = 'polytech-tree:edits:v1'
 export interface UserEdits {
   added: TechNode[]
   deleted: string[]
+  // 节点 id → 自定义颜色（#rrggbb）。不在表里的节点仍用所属领域的颜色
+  colors: Record<string, string>
 }
 
-export const emptyEdits = (): UserEdits => ({ added: [], deleted: [] })
+export const emptyEdits = (): UserEdits => ({ added: [], deleted: [], colors: {} })
 
 export function loadEdits(): UserEdits {
   try {
@@ -17,7 +19,9 @@ export function loadEdits(): UserEdits {
     if (!raw) return emptyEdits()
     const o = JSON.parse(raw) as Partial<UserEdits>
     if (!Array.isArray(o.added) || !Array.isArray(o.deleted)) return emptyEdits()
-    return { added: o.added, deleted: o.deleted }
+    // colors 是后加的字段：旧存档没有它，缺省视为"全部跟随领域色"
+    const colors = o.colors && typeof o.colors === 'object' ? o.colors : {}
+    return { added: o.added, deleted: o.deleted, colors }
   } catch {
     return emptyEdits() // 隐私模式 / 配额异常时静默退回基础数据
   }
@@ -37,12 +41,14 @@ export function clearEdits() {
   } catch { /* 同上 */ }
 }
 
-export const hasEdits = (e: UserEdits) => e.added.length > 0 || e.deleted.length > 0
+export const hasEdits = (e: UserEdits) =>
+  e.added.length > 0 || e.deleted.length > 0 || Object.keys(e.colors).length > 0
 
 /**
  * 把增删叠加到基础数据上：
  * - 被删节点移除（新增的也在删除集里一并摘掉）
  * - prereqs / related 指向已删节点时同步清理，免得留下悬空引用让连线凭空消失
+ * - colors 里的自定义色覆盖节点原有的"跟随领域"
  */
 export function applyEdits(base: TechNode[], e: UserEdits): TechNode[] {
   if (!hasEdits(e)) return base
@@ -55,9 +61,10 @@ export function applyEdits(base: TechNode[], e: UserEdits): TechNode[] {
   return merged.map(n => {
     const prereqs = n.prereqs.filter(p => alive.has(p))
     const related = n.related.filter(r => alive.has(r))
-    return prereqs.length === n.prereqs.length && related.length === n.related.length
-      ? n
-      : { ...n, prereqs, related }
+    const color = e.colors[n.id]
+    const prunedPreds = prereqs.length !== n.prereqs.length || related.length !== n.related.length
+    if (!prunedPreds && !color) return n
+    return { ...n, prereqs, related, ...(color ? { color } : {}) }
   })
 }
 

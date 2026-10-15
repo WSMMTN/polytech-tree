@@ -516,6 +516,11 @@ function tooltipHTML(idx: number, pinned: boolean): string {
     ? `<div class="tt-dim">已聚焦：与其直接相连（一跳）的科技</div>`
     : focusDepth && focusDepth[idx] >= 0
       ? `<div class="tt-dim">在聚焦范围内（${focusDepth[idx]} 跳）</div>` : ''
+  // 编辑模式下卡片上直接改这个节点的颜色（写进叠加层，不改仓库数据）
+  const colorRow = editMode
+    ? `<label class="tt-color"><input type="color" data-role="color" data-id="${esc(n.id)}" value="${esc(n.color ?? CATEGORY_HEX[n.category])}" title="改这个节点的颜色" /><span>改色</span></label>
+       ${n.color ? `<button data-act="uncolor">↺ 恢复领域色</button>` : ''}`
+    : ''
   return `
     <div class="tt-name">${esc(n.name)}</div>
     <div class="tt-dim">${n.nameEn !== n.name ? esc(n.nameEn) + ' · ' : ''}${yearText(n)}</div>
@@ -530,7 +535,7 @@ function tooltipHTML(idx: number, pinned: boolean): string {
           （CC BY-SA 4.0）</div>`
       : ''}
     ${pinned
-      ? `<div class="tt-actions">${editMode ? `<button data-act="del">🗑 删除此节点</button>` : ''}<button data-act="focus">⌖ 聚焦关联</button><button data-act="close">✕ 关闭</button></div>`
+      ? `<div class="tt-actions">${colorRow}${editMode ? `<button data-act="del">🗑 删除此节点</button>` : ''}<button data-act="focus">⌖ 聚焦关联</button><button data-act="close">✕ 关闭</button></div>`
       : ''}
   `
 }
@@ -555,6 +560,14 @@ function hidePinnedTooltip() {
   delete tooltip.dataset.node
 }
 
+/** 卡片内容随数据变了就地重画（位置不动，免得"改色"这种小操作把卡片弹走） */
+function refreshPinnedCard() {
+  const id = tooltip.dataset.node
+  const idx = id ? placedByIdx.get(id) : undefined
+  if (idx === undefined || !tooltip.classList.contains('pinned')) return
+  tooltip.innerHTML = tooltipHTML(idx, true)
+}
+
 tooltip.addEventListener('click', e => {
   const act = (e.target as HTMLElement).dataset?.act
   if (!act) return
@@ -566,8 +579,22 @@ tooltip.addEventListener('click', e => {
   } else if (act === 'del' && id) {
     deleteNode(id)
     return
+  } else if (act === 'uncolor' && id) {
+    setNodeColor(id, null)
+    refreshPinnedCard()
+    return
   }
   hidePinnedTooltip()
+})
+
+// 卡片里的取色器：拖动即预览（input），松开后重画卡片（change）好让"恢复领域色"按钮跟着出现
+tooltip.addEventListener('input', e => {
+  const el = e.target as HTMLInputElement
+  if (el.dataset?.role === 'color') setNodeColor(el.dataset.id!, el.value)
+})
+tooltip.addEventListener('change', e => {
+  const el = e.target as HTMLInputElement
+  if (el.dataset?.role === 'color') { setNodeColor(el.dataset.id!, el.value); refreshPinnedCard() }
 })
 
 renderer.domElement.addEventListener('pointermove', e => {
@@ -625,7 +652,10 @@ const edEra = document.getElementById('edEra') as HTMLSelectElement
 const edCat = document.getElementById('edCat') as HTMLSelectElement
 const edImp = document.getElementById('edImp') as HTMLSelectElement
 const edKind = document.getElementById('edKind') as HTMLSelectElement
-const edPrereq = document.getElementById('edPrereq') as HTMLSelectElement
+const edPrereq = document.getElementById('edPrereq') as HTMLInputElement
+const edPrereqList = document.getElementById('edPrereqList')!
+const edColor = document.getElementById('edColor') as HTMLInputElement
+const edColorAuto = document.getElementById('edColorAuto') as HTMLInputElement
 const edDesc = document.getElementById('edDesc') as HTMLTextAreaElement
 const edCount = document.getElementById('edCount')!
 
@@ -636,28 +666,124 @@ edKind.innerHTML = `<option value="">（未指定）</option>` +
 edImp.innerHTML = [1, 2, 3, 4, 5].map(l =>
   `<option value="${l}"${l === 3 ? ' selected' : ''}>${l} · ${facesOf(l)} 面 ${IMPLbl[l - 1]}</option>`).join('')
 
-// 前置候选近四千项：每次重建都塞满 option 会让 DOM 与快照体积爆炸，故改为首次展开时才填充
-let prereqDirty = true
+// ───── 前置科技：近四千项不适合下拉框，改成"输入即过滤"的可搜索选择器 ─────
+// 索引懒建（首次输入时才展开全量），数据重建后置空等下次再建
+type PrereqEntry = { t: TechNode; name: string; en: string; hay: string }
+let prereqIndex: PrereqEntry[] | null = null
+let prereqHits: TechNode[] = []
+let prereqActive = -1
+let prereqId = '' // 已选中的前置 id，'' = 无前置
 
-/** 真正填充前置下拉（首次展开 / 需要取值时才做） */
-function fillPrereqOptions() {
-  if (!prereqDirty || !placed) return
-  prereqDirty = false
-  const prefer = selected !== null ? placed[selected].node.id : ''
-  edPrereq.innerHTML = `<option value="">（无前置）</option>` +
-    placed.map(p => `<option value="${esc(p.node.id)}">${esc(p.node.name)}</option>`).join('')
-  if (prefer && placedByIdx.has(prefer)) edPrereq.value = prefer
+function buildPrereqIndex() {
+  if (prereqIndex || !placed) return
+  prereqIndex = placed.map(p => ({
+    t: p.node,
+    name: p.node.name.toLowerCase(),
+    en: p.node.nameEn.toLowerCase(),
+    hay: `${p.node.name} ${p.node.nameEn} ${p.node.aliases.join(' ')}`.toLowerCase(),
+  }))
 }
 
-/** 数据重建后：把下拉退回"未填充"占位，等用户展开再灌 */
+function renderPrereqList() {
+  if (!prereqHits.length) {
+    edPrereqList.innerHTML = ''
+    edPrereqList.classList.remove('show')
+    return
+  }
+  edPrereqList.innerHTML = prereqHits.map((t, k) =>
+    `<button type="button" class="ed-combo-item${k === prereqActive ? ' on' : ''}" data-id="${esc(t.id)}"><span>${esc(t.name)}</span><i>${esc(t.nameEn)}</i></button>`
+  ).join('')
+  edPrereqList.classList.add('show')
+}
+
+function searchPrereq() {
+  const q = edPrereq.value.trim().toLowerCase()
+  prereqActive = -1
+  if (!q) {
+    prereqHits = []
+    renderPrereqList()
+    return
+  }
+  buildPrereqIndex()
+  const hits: { t: TechNode; rank: number }[] = []
+  for (const s of prereqIndex!) {
+    if (!s.hay.includes(q)) continue
+    const rank = s.name.startsWith(q) ? 0 : s.en.startsWith(q) ? 1
+      : s.name.includes(q) || s.en.includes(q) ? 2 : 3
+    hits.push({ t: s.t, rank })
+  }
+  hits.sort((a, b) => a.rank - b.rank || b.t.importance - a.t.importance)
+  prereqHits = hits.slice(0, 10).map(h => h.t)
+  renderPrereqList()
+}
+
+/** 选定一个前置（或传 null 清空），并回填输入框 */
+function pickPrereq(t: TechNode | null) {
+  prereqId = t ? t.id : ''
+  edPrereq.value = t ? t.name : ''
+  prereqHits = []
+  renderPrereqList()
+}
+
+edPrereq.addEventListener('input', () => { prereqId = ''; searchPrereq() })
+// 已选中的名字再次聚焦时全选，直接打字就是重新搜，不会被旧名字拖着走
+edPrereq.addEventListener('focus', () => { if (prereqId) edPrereq.select() })
+edPrereq.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault()
+    if (!prereqHits.length) return
+    prereqActive = (prereqActive + (e.key === 'ArrowDown' ? 1 : -1) + prereqHits.length) % prereqHits.length
+    renderPrereqList()
+  } else if (e.key === 'Enter') {
+    if (!prereqHits.length) return
+    e.preventDefault()
+    pickPrereq(prereqHits[prereqActive >= 0 ? prereqActive : 0])
+  } else if (e.key === 'Escape') {
+    prereqHits = []
+    renderPrereqList()
+  }
+})
+edPrereqList.addEventListener('click', e => {
+  const el = (e.target as HTMLElement).closest('.ed-combo-item') as HTMLElement | null
+  if (el) pickPrereq(techById.get(el.dataset.id!) ?? null)
+})
+document.getElementById('edPrereqClear')!.addEventListener('click', () => pickPrereq(null))
+// 点到组合框以外就收起候选（点候选本身属于框内，故 pointerdown 阶段收起不会打断选择）
+document.addEventListener('pointerdown', e => {
+  if (prereqHits.length && !(e.target as HTMLElement).closest?.('.ed-combo')) {
+    prereqHits = []
+    renderPrereqList()
+  }
+})
+
+// ───── 颜色：新增节点可自选，缺省跟随领域色；已有节点在卡片上改 ─────
+/** 勾选"跟随领域色"时，色块只作预览并禁用；领域变了就跟着变 */
+function syncColorPreview() {
+  edColor.disabled = edColorAuto.checked
+  if (edColorAuto.checked) edColor.value = CATEGORY_HEX[Number(edCat.value)] ?? '#5a8cff'
+}
+edCat.addEventListener('change', syncColorPreview)
+edColorAuto.addEventListener('change', syncColorPreview)
+syncColorPreview()
+
+/** 记一笔自定义色（写进叠加层），并把当前画面上这个节点立即重绘 */
+function setNodeColor(id: string, hex: string | null) {
+  if (hex) edits.colors[id] = hex
+  else delete edits.colors[id]
+  saveEdits(edits)
+  const idx = placedByIdx.get(id)
+  if (idx === undefined) return
+  const node = placed[idx].node
+  if (hex) node.color = hex
+  else delete node.color
+  field.setBaseColor(idx, hex) // 只重绘这一个节点，不重建世界
+}
+
+/** 数据重建后：前置索引置空重算，已选中的前置若被删掉则一并清掉 */
 function markPrereqDirty() {
-  prereqDirty = true
-  edPrereq.innerHTML = `<option value="">（展开后可选 ${placed ? placed.length : 0} 项）</option>`
+  prereqIndex = null
+  if (prereqId && !techById.has(prereqId)) pickPrereq(null)
 }
-
-edPrereq.addEventListener('pointerdown', fillPrereqOptions)
-edPrereq.addEventListener('focus', fillPrereqOptions)
-edPrereq.addEventListener('click', fillPrereqOptions)
 
 function setEditMode(on: boolean) {
   editMode = on
@@ -666,6 +792,8 @@ function setEditMode(on: boolean) {
   document.body.classList.toggle('editing', on)
   if (on) {
     hidePinnedTooltip()
+    // 先把当前聚焦的节点填进"前置"，新建的项多半就挂在它下面
+    if (selected !== null && !prereqId) pickPrereq(placed[selected].node)
     // 编辑时不需要聚焦高亮干扰判断，先解除
     if (selected !== null) selectNode(null)
   }
@@ -682,6 +810,8 @@ function deleteNode(id: string) {
   } else if (!edits.deleted.includes(id)) {
     edits.deleted.push(id)
   }
+  delete edits.colors[id] // 节点都没了，自定义色一并清掉
+  if (prereqId === id) pickPrereq(null)
   saveEdits(edits)
   hidePinnedTooltip()
   rebuildAfterDataChange(null)
@@ -692,9 +822,9 @@ document.getElementById('edAdd')!.addEventListener('click', () => {
   const nameEn = edNameEn.value.trim()
   if (!name && !nameEn) { edName.focus(); return }
   const year = Number(edYear.value)
-  const prereq = edPrereq.value
+  const id = newTechId()
   const node: TechNode = {
-    id: newTechId(),
+    id,
     name: name || nameEn,
     nameEn: nameEn || name,
     wikiEn: '',
@@ -706,16 +836,21 @@ document.getElementById('edAdd')!.addEventListener('click', () => {
     era: Number(edEra.value),
     category: Number(edCat.value),
     importance: Number(edImp.value),
-    prereqs: prereq && placedByIdx.has(prereq) ? [prereq] : [],
+    prereqs: prereqId && placedByIdx.has(prereqId) ? [prereqId] : [],
     related: [],
     desc: edDesc.value.trim(),
   }
   edits.added.push(node)
+  // 自定义色与新增节点一样只记在叠加层：color 缺省即跟随领域
+  if (!edColorAuto.checked) edits.colors[id] = edColor.value
   saveEdits(edits)
   edName.value = ''
   edNameEn.value = ''
   edDesc.value = ''
-  rebuildAfterDataChange(node.id) // 重建后把相机飞到新节点，立刻看到它落在哪
+  edColorAuto.checked = true
+  syncColorPreview()
+  pickPrereq(null)
+  rebuildAfterDataChange(id) // 重建后把相机飞到新节点，立刻看到它落在哪
 })
 
 document.getElementById('edRestore')!.addEventListener('click', () => {
@@ -733,7 +868,7 @@ function refreshInterface() {
   buildSearchIndex()
   markPrereqDirty()
   edCount.textContent = hasEdits(edits)
-    ? `已添加 ${edits.added.length} 项（绿框）· 已删除 ${edits.deleted.length} 项`
+    ? `已添加 ${edits.added.length} 项 · 已删除 ${edits.deleted.length} 项 · 改色 ${Object.keys(edits.colors).length} 项`
     : '当前为调研原始数据'
   edCount.classList.toggle('dirty', hasEdits(edits))
 }

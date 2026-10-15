@@ -38,7 +38,8 @@ export class PolyhedraField {
   meshes: THREE.InstancedMesh[] = []
   private metas: InstanceMeta[][] = []
   private highlightIdx: number | null = null
-  private colors: THREE.Color[]
+  private domainColors: THREE.Color[]
+  private nodeColors: THREE.Color[]
   private tmp = new THREE.Object3D()
   private white = new THREE.Color(0xffffff)
   // 隐去（领域/kind 掩码）：不改布局、不改尺寸，只把颜色压到背景上，并从射线拾取里剔除
@@ -58,8 +59,11 @@ export class PolyhedraField {
   private tmpColor = new THREE.Color()
 
   constructor(placed: PlacedNode[], colors: THREE.Color[]) {
-    this.colors = colors
     this.byIdx = placed
+    this.domainColors = colors
+    // 每个节点的实际底色：有自定义色就用它，否则回落到所属领域的颜色
+    this.nodeColors = placed.map(p =>
+      p.node.color ? new THREE.Color(p.node.color) : colors[p.node.category])
     const buckets: InstanceMeta[][] = Array.from({ length: LEVELS }, () => [])
     placed.forEach((p, globalIdx) => {
       const level = Math.min(LEVELS, Math.max(1, Math.round(p.node.importance))) - 1
@@ -75,7 +79,7 @@ export class PolyhedraField {
       )
       mesh.count = meta.length
       mesh.frustumCulled = false // 实例分布全塔，禁用剔除避免误裁
-      meta.forEach((m, i) => mesh.setColorAt(i, colors[m.placed.node.category]))
+      meta.forEach((m, i) => mesh.setColorAt(i, this.nodeColors[m.nodeIdx]))
       this.meshes.push(mesh)
       this.metas.push(meta)
     }
@@ -171,13 +175,21 @@ export class PolyhedraField {
   }
 
   private colorOf(nodeIdx: number): THREE.Color {
-    this.tmpColor.copy(this.colors[this.byIdx[nodeIdx].node.category])
+    this.tmpColor.copy(this.nodeColors[nodeIdx])
     if (this.hidden(nodeIdx)) return this.tmpColor.lerp(this.dim, PolyhedraField.HIDE_MIX)
     const hop = this.focus ? this.focus[nodeIdx] : 1
     if (hop === 0) return this.tmpColor.copy(this.white)
     if (hop < 0) return this.tmpColor.lerp(this.dim, PolyhedraField.OUT_MIX)
     if (this.highlightIdx === nodeIdx) return this.tmpColor.lerp(this.white, PolyhedraField.HOVER_MIX)
     return this.tmpColor
+  }
+
+  /** 换某个节点的底色（null = 跟随领域色）：底色缓存改了要就地重绘，控制器不必重建整个世界 */
+  setBaseColor(nodeIdx: number, hex: string | null) {
+    this.nodeColors[nodeIdx] = hex
+      ? new THREE.Color(hex)
+      : this.domainColors[this.byIdx[nodeIdx].node.category]
+    this.repaint(nodeIdx)
   }
 
   /** 悬停提亮：nodeIdx 为全局索引，null 恢复 */

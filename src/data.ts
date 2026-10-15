@@ -70,6 +70,8 @@ export interface TechNode {
   prereqs: string[]
   related: string[]
   desc: string
+  // 自定义颜色（#rrggbb）。缺省 = 跟随所属领域的颜色；由 edit.ts 的叠加层写入
+  color?: string
 }
 
 export const TECHS: TechNode[] = techs.map(t => ({

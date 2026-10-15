@@ -358,6 +358,7 @@ body {
 #tooltip.pinned { pointer-events: auto; }
 .tt-actions {
   display: flex;
+  flex-wrap: wrap; /* 编辑模式下多了"改色"与"恢复领域色"，窄屏上换行免得挤出卡片 */
   gap: 8px;
   margin-top: 6px;
   padding-top: 6px;
@@ -471,9 +472,62 @@ body.touring #editPanel { opacity: 0; pointer-events: none; }
 #editPanel .ed-actions .ed-primary:hover { background: rgba(57, 203, 208, 0.34); }
 #editPanel .ed-hint { font-size: 10px; line-height: 1.6; opacity: 0.45; margin-top: 10px; }
 
+/* 前置科技：近四千项不适合下拉框，改成"输入即过滤"的选择器。
+   候选列表就地展开（不是浮层），免得被 .ed-fields 的滚动裁掉 */
+#editPanel .ed-combo { position: relative; }
+#editPanel .ed-combo input { padding-right: 24px; }
+#editPanel .ed-combo-x {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  width: 18px; height: 18px; padding: 0; line-height: 1; font-size: 10px;
+  border: 1px solid transparent; border-radius: 5px; background: transparent;
+  color: inherit; opacity: 0.45; cursor: pointer;
+}
+#editPanel .ed-combo-x:hover { opacity: 0.9; background: rgba(90, 140, 255, 0.2); }
+#editPanel .ed-combo-list { display: none; }
+#editPanel .ed-combo-list.show {
+  display: block; margin-top: 4px; max-height: 170px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 6px; background: rgba(6, 10, 22, 0.92);
+}
+#editPanel .ed-combo-item {
+  display: flex; align-items: baseline; gap: 6px; width: 100%;
+  font: inherit; font-size: 12px; text-align: left; color: inherit;
+  padding: 5px 7px; border: 0; background: transparent; cursor: pointer;
+}
+#editPanel .ed-combo-item i {
+  font-style: normal; font-size: 10px; opacity: 0.45;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#editPanel .ed-combo-item:hover,
+#editPanel .ed-combo-item.on { background: rgba(90, 140, 255, 0.18); }
+
+/* 颜色：色块 + "跟随领域色"开关；勾选时色块只作预览 */
+#editPanel .ed-color { display: flex; align-items: center; gap: 8px; }
+#editPanel .ed-color input[type="color"] {
+  flex: none; width: 34px; height: 26px; padding: 0 2px; cursor: pointer;
+}
+#editPanel .ed-color input[type="color"]:disabled { opacity: 0.6; cursor: default; }
+#editPanel .ed-color input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+#editPanel .ed-color-auto {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; opacity: 0.7; cursor: pointer;
+}
+#editPanel .ed-color-auto input {
+  width: auto; padding: 0; border: 0; background: transparent; accent-color: #5a8cff;
+}
+
 /* 删除按钮用暖色，与"聚焦/关闭"分清，避免误点 */
 .tt-actions button[data-act="del"] { color: #ff9d9d; border-color: rgba(255, 120, 120, 0.4); }
 .tt-actions button[data-act="del"]:hover { background: rgba(255, 80, 80, 0.25); }
+/* 卡片上的取色器（仅编辑模式）：和按钮同高，点一下就打开系统调色板 */
+.tt-actions .tt-color {
+  display: flex; align-items: center; gap: 4px; cursor: pointer;
+  font-size: 11px; letter-spacing: 1px; padding: 2px 8px 2px 4px;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.tt-actions .tt-color:hover { background: rgba(90, 140, 255, 0.32); }
+.tt-actions .tt-color input[type="color"] {
+  width: 24px; height: 18px; padding: 0; border: 0; background: transparent; cursor: pointer;
+}
 
 @media (max-width: 720px) {
   #editPanel {
