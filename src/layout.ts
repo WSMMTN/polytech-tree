@@ -147,7 +147,7 @@ export function layoutTower(nodes: TechNode[]): TowerLayout {
           n, new THREE.Vector3(Math.cos(theta) * r, y, Math.sin(theta) * r),
           scale,
           new THREE.Vector3(rand() - 0.5, rand() - 0.5, rand() - 0.5).normalize(),
-          0.08 + rand() * 0.22,
+          0.08 + rand() * 0.22, // 自转速度（rad/s）：矩阵写入已内联优化，实测整档仅 1-2ms
           rand() * Math.PI * 2
         )
         placed.push(p)

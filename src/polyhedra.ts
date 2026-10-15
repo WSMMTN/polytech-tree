@@ -57,6 +57,9 @@ export class PolyhedraField {
   private tourTime = -1
   private flashFlags: Uint8Array[] = []
   private tmpColor = new THREE.Color()
+  // 是否存在自转实例（构造时算一次，spinSpeed 运行期不变）：
+  // 全为 0 时常规模式下 update() 可整体 early return，零 CPU 开销
+  private anySpin = false
 
   constructor(placed: PlacedNode[], colors: THREE.Color[]) {
     this.byIdx = placed
@@ -70,36 +73,44 @@ export class PolyhedraField {
       buckets[level].push({ nodeIdx: globalIdx, placed: p })
     })
 
+    // 5 档共享同一材质（颜色由 instanceColor 覆盖，基色参数完全相同）
+    const sharedMat = new THREE.MeshStandardMaterial({ metalness: 0.15, roughness: 0.55 })
     for (let lv = 0; lv < LEVELS; lv++) {
       const meta = buckets[lv]
       const mesh = new THREE.InstancedMesh(
         BY_IMPORTANCE[lv],
-        new THREE.MeshStandardMaterial({ metalness: 0.15, roughness: 0.55 }),
+        sharedMat,
         Math.max(1, meta.length)
       )
       mesh.count = meta.length
-      mesh.frustumCulled = false // 实例分布全塔，禁用剔除避免误裁
+      mesh.frustumCulled = true
       meta.forEach((m, i) => mesh.setColorAt(i, this.nodeColors[m.nodeIdx]))
       this.meshes.push(mesh)
       this.metas.push(meta)
     }
+    this.anySpin = this.metas.some(meta => meta.some(m => m.placed.spinSpeed > 0))
   }
 
-  /** 每帧更新自转；漫游中还要处理"按年份逐个显现 + 闪亮" */
+  /** 每帧更新自转；漫游中还要处理"按年份逐个显现 + 闪亮"。
+   *  矩阵计算内联手写 TRS，绕开 Object3D.updateMatrix 的属性查找开销。
+   *  注：若所有 spinSpeed=0（如自定义数据关闭动态），常规模式下直接零开销返回。 */
   update(time: number) {
+    if (!this.revealAt && !this.anySpin) return
     const reveal = this.revealAt
     for (let lv = 0; lv < this.meshes.length; lv++) {
       const mesh = this.meshes[lv]
       const meta = this.metas[lv]
       const flags = reveal ? this.flashFlags[lv] : null
       let repaint = false
+      const arr = mesh.instanceMatrix.array as Float32Array
       for (let i = 0; i < meta.length; i++) {
         const p = meta[i].placed
+        const nodeIdx = meta[i].nodeIdx
         let s = p.scale
         let flash = 0
-        if (this.hidden(meta[i].nodeIdx)) s = 0 // 隐去：不在画面里占位，也不挡后面的节点
+        if (this.hidden(nodeIdx)) s = 0
         else if (reveal) {
-          const age = this.tourTime - reveal[meta[i].nodeIdx]
+          const age = this.tourTime - reveal[nodeIdx]
           if (age < 0) s = 0
           else if (age < FLASH) {
             const k = age / FLASH
@@ -107,22 +118,28 @@ export class PolyhedraField {
             flash = 1 - k
           }
         }
-        this.tmp.position.copy(p.position)
-        this.tmp.quaternion.setFromAxisAngle(p.spinAxis, p.phase + time * p.spinSpeed)
-        this.tmp.scale.setScalar(s)
-        this.tmp.updateMatrix()
-        mesh.setMatrixAt(i, this.tmp.matrix)
+        // 手写 TRS 矩阵（绕 spinAxis 自转），直接写 instanceMatrix.array
+        const a = p.phase + time * p.spinSpeed
+        const ca = Math.cos(a), sa = Math.sin(a)
+        const ax = p.spinAxis.x, ay = p.spinAxis.y, az = p.spinAxis.z
+        const k1 = 1 - ca, k2 = sa
+        const s11 = ca + ax * ax * k1,        s12 = ax * ay * k1 - az * k2, s13 = ax * az * k1 + ay * k2
+        const s21 = ay * ax * k1 + az * k2,    s22 = ca + ay * ay * k1,       s23 = ay * az * k1 - ax * k2
+        const s31 = az * ax * k1 - ay * k2,    s32 = az * ay * k1 + ax * k2,  s33 = ca + az * az * k1
+        const off = i * 16
+        arr[off + 0]  = s * s11; arr[off + 1]  = s * s21; arr[off + 2]  = s * s31; arr[off + 3]  = 0
+        arr[off + 4]  = s * s12; arr[off + 5]  = s * s22; arr[off + 6]  = s * s32; arr[off + 7]  = 0
+        arr[off + 8]  = s * s13; arr[off + 9]  = s * s23; arr[off + 10] = s * s33; arr[off + 11] = 0
+        arr[off + 12] = p.position.x; arr[off + 13] = p.position.y; arr[off + 14] = p.position.z; arr[off + 15] = 1
 
         if (flags) {
           const was = flags[i] > 0
           if (flash > 0) {
-            // 显现瞬间冲亮（闪白是漫游里唯一能抓住眼的信号）
-            mesh.setColorAt(i, this.colorOf(meta[i].nodeIdx).multiplyScalar(1 + flash * 12))
+            mesh.setColorAt(i, this.colorOf(nodeIdx).multiplyScalar(1 + flash * 12))
             flags[i] = 1
             repaint = true
           } else {
-            // 闪亮结束的那一帧把颜色写回本档，其余帧不动这张 buffer
-            if (was) { mesh.setColorAt(i, this.colorOf(meta[i].nodeIdx)); repaint = true }
+            if (was) { mesh.setColorAt(i, this.colorOf(nodeIdx)); repaint = true }
             flags[i] = 0
           }
         }
@@ -165,7 +182,29 @@ export class PolyhedraField {
   private repaintAll() {
     for (let lv = 0; lv < this.meshes.length; lv++) {
       const mesh = this.meshes[lv]
-      this.metas[lv].forEach((m, i) => mesh.setColorAt(i, this.colorOf(m.nodeIdx)))
+      const arr = mesh.instanceMatrix.array as Float32Array
+      const meta = this.metas[lv]
+      for (let i = 0; i < meta.length; i++) {
+        const m = meta[i]
+        const p = m.placed
+        const s = this.hidden(m.nodeIdx) ? 0 : p.scale
+        // 隐藏时 scale=0 避免 update 不跑后节点仍显示；同时 update 的 early-return 不触发
+        // 但 scale 仍是 0，节点不会被画出来
+        const a = p.phase
+        const ca = Math.cos(a), sa = Math.sin(a)
+        const ax = p.spinAxis.x, ay = p.spinAxis.y, az = p.spinAxis.z
+        const k1 = 1 - ca, k2 = sa
+        const s11 = ca + ax * ax * k1,        s12 = ax * ay * k1 - az * k2, s13 = ax * az * k1 + ay * k2
+        const s21 = ay * ax * k1 + az * k2,    s22 = ca + ay * ay * k1,       s23 = ay * az * k1 - ax * k2
+        const s31 = az * ax * k1 - ay * k2,    s32 = az * ay * k1 + ax * k2,  s33 = ca + az * az * k1
+        const off = i * 16
+        arr[off + 0]  = s * s11; arr[off + 1]  = s * s21; arr[off + 2]  = s * s31; arr[off + 3]  = 0
+        arr[off + 4]  = s * s12; arr[off + 5]  = s * s22; arr[off + 6]  = s * s32; arr[off + 7]  = 0
+        arr[off + 8]  = s * s13; arr[off + 9]  = s * s23; arr[off + 10] = s * s33; arr[off + 11] = 0
+        arr[off + 12] = p.position.x; arr[off + 13] = p.position.y; arr[off + 14] = p.position.z; arr[off + 15] = 1
+        mesh.setColorAt(i, this.colorOf(m.nodeIdx))
+      }
+      mesh.instanceMatrix.needsUpdate = true
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
     }
   }

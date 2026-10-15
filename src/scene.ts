@@ -19,9 +19,16 @@ export function createScene(towerHeight: number, eraRadii: number[] = []): {
   const d = eraRadii.length ? startViewDistance(eraRadii, towerHeight) / Math.SQRT2 : 260
   camera.position.set(d, towerHeight * 0.68, d)
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true })
+  // GPU 填充率是本场景的主要瓶颈（3862 实例 + 四千条加法混合线全程满屏覆盖）：
+  // - DPR 上限压到 1.5：DPR=3 的手机若按 2 渲染就是 4 倍像素量
+  // - 高 DPR 屏不开 MSAA：像素密度已掩盖锯齿，4x 采样纯属双倍浪费
+  // - powerPreference：Android WebView 常默认省电核显，显式要求高性能 GPU
+  const renderer = new THREE.WebGLRenderer({
+    antialias: devicePixelRatio < 1.5,
+    powerPreference: 'high-performance',
+  })
   renderer.setSize(innerWidth, innerHeight)
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5))
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1.1
   renderer.outputColorSpace = THREE.SRGBColorSpace

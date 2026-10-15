@@ -3,7 +3,7 @@ import type { PlacedNode } from './layout'
 import { CATEGORY_COLORS } from './scene'
 import { ERA_COUNT } from './data'
 
-const SEG = 8 // 每条弧线的分段数
+const SEG = 4 // 每条弧线的分段数（原 8：减半顶点，弧线仍足够平滑）
 const GROW_MAX = 1.6 // 单条边可见爬行的最长时长（秒）
 const OPACITY = 0.3        // 常态：四千多条线同时要看得见，单条只能压得很低
 const FOCUS_OPACITY = 0.62 // 聚焦时只剩子图那几十条，抬上来才读得出因果走向

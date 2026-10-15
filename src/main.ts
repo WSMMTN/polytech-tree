@@ -1005,6 +1005,7 @@ function loop() {
   const time = clock.elapsedTime
 
   rig.update(dt)
+
   if (rig.mode === 'tour') {
     const t = rig.tourT - BLEND
     applyFov(plan.fovAt(t))
@@ -1016,11 +1017,9 @@ function loop() {
   } else {
     field.update(time)
     field.highlight(hoverIdx)
-    // 名称：仅完整在屏内的，按距离保留最近 limit 个
     nameLabels.update(camera, labelLimit, innerWidth, innerHeight)
+    renderer.render(scene, camera)
   }
-  eraLabels.update() // 时代名位置固定，无需每帧更新（保留接口兼容）
-
-  renderer.render(scene, camera)
+  eraLabels.update()
 }
 loop()
