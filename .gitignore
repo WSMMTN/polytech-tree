@@ -48,3 +48,5 @@ __pycache__/
 data/adjud/metrics.json
 # 代理自测产生的裁决分片，不是真实裁决
 data/adjud/*.selftest.json
+
+supabase/.temp/
