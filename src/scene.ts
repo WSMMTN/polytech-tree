@@ -25,7 +25,9 @@ export function createScene(towerHeight: number, eraRadii: number[] = []): {
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1.1
   renderer.outputColorSpace = THREE.SRGBColorSpace
-  document.getElementById('app')!.appendChild(renderer.domElement)
+  const app = document.getElementById('app')!
+  app.textContent = '' // 清掉"正在加载"占位
+  app.appendChild(renderer.domElement)
 
   // 灯光
   scene.add(new THREE.AmbientLight(0x8899bb, 0.75))

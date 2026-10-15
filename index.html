@@ -3,15 +3,26 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#05070f" />
+  <!-- iOS：Safari「添加到主屏幕」后按全屏应用运行，隐藏地址栏与状态栏 -->
+  <meta name="apple-mobile-web-app-capable" content="true" />
+  <meta name="mobile-web-app-capable" content="true" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="人类科技树" />
   <link rel="icon" href="data:," />
   <title>人类科技树 · 3D 世界</title>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="app"><div id="loading">正在加载人类科技树…</div></div>
 
   <div id="title" class="panel">
     <h1>人类科技树</h1>
     <small id="statLine"></small>
+  </div>
+
+  <div id="search" class="panel">
+    <input id="searchBox" type="text" placeholder="搜索科技：名称 / 英文 / 别名" autocomplete="off" />
+    <div id="searchResults"></div>
   </div>
 
   <div id="legend" class="panel"></div>
@@ -19,9 +30,44 @@
   <div id="toolbar" class="panel">
     <button id="btnTour">▶ 漫游动画</button>
     <button id="btnReset">⟲ 重置视角</button>
+    <button id="btnEdit">✎ 编辑</button>
   </div>
 
-  <div id="hint">拖拽旋转 · 滚轮缩放 · 右键平移 · 悬停查看信息 · 点击节点只留相连的科技（再点或 Esc 取消）· 漫游中按 Esc 退出</div>
+  <div id="editPanel" class="panel hidden">
+    <div class="ed-head">
+      <div class="ed-title">编辑数据 · 增删节点</div>
+      <button id="edClose" class="ed-x" title="关闭">✕</button>
+    </div>
+    <div class="ed-count" id="edCount"></div>
+    <div class="ed-fields">
+      <div class="ed-row">
+        <label class="ed-f"><span>中文名</span>
+          <input id="edName" type="text" placeholder="如：蒸汽机" autocomplete="off" /></label>
+        <label class="ed-f"><span>英文名</span>
+          <input id="edNameEn" type="text" placeholder="如：Steam engine" autocomplete="off" /></label>
+      </div>
+      <div class="ed-row">
+        <label class="ed-f"><span>时代</span><select id="edEra"></select></label>
+        <label class="ed-f"><span>领域</span><select id="edCat"></select></label>
+      </div>
+      <div class="ed-row">
+        <label class="ed-f"><span>重要度</span><select id="edImp"></select></label>
+        <label class="ed-f"><span>类型 kind</span><select id="edKind"></select></label>
+      </div>
+      <label class="ed-f"><span>年代（负数为公元前）</span>
+        <input id="edYear" type="number" value="1900" step="1" /></label>
+      <label class="ed-f"><span>前置科技</span><select id="edPrereq"><option value="">（展开后可搜索选择）</option></select></label>
+      <label class="ed-f"><span>简介</span>
+        <textarea id="edDesc" rows="2" placeholder="可选"></textarea></label>
+    </div>
+    <div class="ed-actions">
+      <button id="edAdd" class="ed-primary">＋ 添加科技</button>
+      <button id="edRestore">↺ 恢复默认数据</button>
+    </div>
+    <div class="ed-hint">增删只存在本机（localStorage），不改动仓库数据；删除请点节点卡片里的「🗑 删除此节点」</div>
+  </div>
+
+  <div id="hint">拖拽旋转 · 滚轮缩放 · 右键平移 · 悬停查看信息 · 点击节点只留直接相连（一跳）的科技（再点或 Esc 取消）· 漫游中按 Esc 退出</div>
 
   <div id="eraCaption"></div>
   <div id="tooltip"></div>

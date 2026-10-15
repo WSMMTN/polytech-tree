@@ -17,6 +17,68 @@ body {
 
 #app canvas { display: block; }
 
+#loading {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  letter-spacing: 4px;
+  opacity: 0.6;
+}
+
+/* 搜索：顶部居中，结果下拉随输入即时过滤 */
+#search {
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(320px, 56vw);
+  padding: 6px;
+}
+#searchBox {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--text);
+  background: rgba(5, 9, 20, 0.6);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 7px 10px;
+  outline: none;
+}
+#searchBox:focus { border-color: rgba(90, 140, 255, 0.55); }
+#searchBox::placeholder { color: rgba(150, 170, 205, 0.5); }
+#searchResults { display: none; max-height: 50vh; overflow-y: auto; }
+#searchResults.show { display: block; margin-top: 4px; }
+.sr-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.sr-item i {
+  flex: 1;
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sr-item b { font-weight: 400; font-size: 10px; color: #ffd97a; letter-spacing: 1px; }
+.sr-item:hover, .sr-item.on { background: rgba(90, 140, 255, 0.18); }
+
 .panel {
   position: fixed;
   z-index: 10;
@@ -284,17 +346,139 @@ body {
   line-height: 1.65;
   letter-spacing: 0.3px;
   color: rgba(150, 170, 205, 0.6);
+  /* 署名区在右下角与工具栏相邻：整块不接事件，免得挡住最右侧的工具栏按钮；链接本身仍可点 */
+  pointer-events: none;
 }
-#credit a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+#credit a { color: inherit; text-decoration: underline; text-underline-offset: 2px; pointer-events: auto; }
 #credit a:hover { color: #cfe0ff; }
 #tooltip a { color: #8fb6ff; }
 #tooltip a:hover { color: #dfe9ff; }
 
+/* 触摸点按出的固定卡片：需要接住按钮点击 */
+#tooltip.pinned { pointer-events: auto; }
+.tt-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(90, 140, 255, 0.25);
+}
+.tt-actions button {
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  background: rgba(60, 100, 200, 0.18);
+  color: inherit;
+  border: 1px solid var(--line);
+}
+.tt-actions button:hover { background: rgba(90, 140, 255, 0.32); }
+
+/* 小屏适配：面板收拢、字缩小，固定卡片沉底成通栏 */
+@media (max-width: 720px) {
+  #title { top: 10px; left: 10px; padding: 8px 12px; }
+  #title h1 { font-size: 14px; letter-spacing: 2px; }
+  #search { top: 10px; width: min(240px, 46vw); }
+  #legend { top: 10px; right: 10px; }
+  #hint { display: none; }
+  #eraCaption { font-size: 26px; letter-spacing: 6px; }
+  #credit { font-size: 9px; max-width: 200px; right: 10px; bottom: 10px; }
+  #tooltip.pinned {
+    left: 10px !important;
+    right: 10px;
+    top: auto !important;
+    bottom: 84px;
+    white-space: normal;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+}
+
 /* 漫游动画：画面只留时代名与科技名，其余界面淡出。退出用热键 Esc（或点击画面），故工具栏整体隐去 */
-#title, #legend, #hint, #toolbar, #credit { transition: opacity 0.5s; }
+#title, #legend, #hint, #toolbar, #credit, #search { transition: opacity 0.5s; }
 body.touring #title,
 body.touring #legend,
 body.touring #hint,
 body.touring #toolbar,
-body.touring #credit { opacity: 0; pointer-events: none; }
+body.touring #credit,
+body.touring #search { opacity: 0; pointer-events: none; }
 body.touring #tooltip { display: none; }
+
+/* ───── 编辑面板（增删节点） ───── */
+.hidden { display: none !important; }
+
+#editPanel {
+  top: 96px;
+  left: 16px;
+  width: 272px;
+  padding: 12px 14px;
+  max-height: calc(100vh - 150px);
+  overflow: visible;
+  z-index: 11;
+  transition: opacity 0.4s;
+}
+body.touring #editPanel { opacity: 0; pointer-events: none; }
+
+#editPanel .ed-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+#editPanel .ed-title { font-size: 11px; letter-spacing: 2px; opacity: 0.6; }
+#editPanel .ed-x {
+  flex: none; font: inherit; font-size: 11px; line-height: 1;
+  padding: 3px 7px; border-radius: 6px; cursor: pointer;
+  background: rgba(60, 100, 200, 0.18); color: inherit; border: 1px solid var(--line);
+}
+#editPanel .ed-x:hover { background: rgba(90, 140, 255, 0.32); }
+#editPanel .ed-count {
+  font-size: 10px; letter-spacing: 1px; opacity: 0.5;
+  margin: 6px 0 10px; padding: 4px 6px; border-radius: 6px;
+  background: rgba(90, 140, 255, 0.07);
+}
+#editPanel .ed-count.dirty { opacity: 0.9; color: #8ef0a8; }
+/* 字段区自己滚动，操作按钮固定在面板底部：矮屏上也不用滚到底才能点到"添加" */
+#editPanel .ed-fields {
+  display: flex; flex-direction: column; gap: 7px;
+  max-height: 44vh; overflow-y: auto; padding-right: 2px;
+}
+#editPanel .ed-row { display: flex; gap: 8px; }
+#editPanel .ed-row .ed-f { flex: 1 1 0; min-width: 0; }
+#editPanel .ed-f { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+#editPanel .ed-f > span { opacity: 0.55; letter-spacing: 1px; }
+#editPanel .ed-f input,
+#editPanel .ed-f select,
+#editPanel .ed-f textarea {
+  font: inherit; font-size: 12px; color: var(--text); width: 100%;
+  background: rgba(6, 10, 22, 0.72); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 7px;
+}
+#editPanel .ed-f textarea { resize: vertical; }
+#editPanel .ed-f input:focus,
+#editPanel .ed-f select:focus,
+#editPanel .ed-f textarea:focus { outline: none; border-color: rgba(90, 140, 255, 0.6); }
+#editPanel .ed-f select option { background: #0a1020; color: var(--text); }
+#editPanel .ed-actions { display: flex; gap: 8px; margin-top: 10px; }
+#editPanel .ed-actions button {
+  flex: 1 1 0; font: inherit; font-size: 12px; letter-spacing: 1px;
+  padding: 7px 8px; border-radius: 7px; cursor: pointer;
+  background: rgba(60, 100, 200, 0.18); color: inherit; border: 1px solid var(--line);
+}
+#editPanel .ed-actions button:hover { background: rgba(90, 140, 255, 0.32); }
+#editPanel .ed-actions .ed-primary {
+  background: rgba(57, 203, 208, 0.2); border-color: rgba(57, 203, 208, 0.55);
+}
+#editPanel .ed-actions .ed-primary:hover { background: rgba(57, 203, 208, 0.34); }
+#editPanel .ed-hint { font-size: 10px; line-height: 1.6; opacity: 0.45; margin-top: 10px; }
+
+/* 删除按钮用暖色，与"聚焦/关闭"分清，避免误点 */
+.tt-actions button[data-act="del"] { color: #ff9d9d; border-color: rgba(255, 120, 120, 0.4); }
+.tt-actions button[data-act="del"]:hover { background: rgba(255, 80, 80, 0.25); }
+
+@media (max-width: 720px) {
+  #editPanel {
+    top: auto; left: 10px; right: 10px; bottom: 78px;
+    width: auto; max-height: 46vh;
+  }
+  #toolbar button { padding: 6px 11px; font-size: 12px; }
+}

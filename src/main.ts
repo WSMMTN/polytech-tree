@@ -1,62 +1,136 @@
 import './style.css'
 import * as THREE from 'three'
-import { TECHS, TECH_BY_ID, ERA_INFO, ERA_COUNT, CATEGORY_NAMES, CATEGORY_COUNT, CATEGORY_HEX, CATEGORY_GROUPS, GROUP_NAMES, YEAR_BASIS_LABEL } from './data'
+import { TECHS, ERA_INFO, ERA_COUNT, CATEGORY_NAMES, CATEGORY_COUNT, CATEGORY_HEX, CATEGORY_GROUPS, GROUP_NAMES, YEAR_BASIS_LABEL } from './data'
 import type { TechNode } from './data'
-import { layoutTower } from './layout'
+import { layoutTower, type PlacedNode } from './layout'
 import { createScene } from './scene'
 import { PolyhedraField, facesOf } from './polyhedra'
 import { buildEdges, buildEraRings } from './edges'
 import { buildNameLabels, buildEraLabels, updateLabelFocal, setLabelMinPxAll } from './labels'
 import { CameraRig } from './controls'
 import { TourPlan, BLEND } from './tour'
-import { buildGraph, kHopDepth } from './graph'
+import { buildGraph, kHopDepth, type DepGraph } from './graph'
+import { loadEdits, saveEdits, clearEdits, emptyEdits, applyEdits, hasEdits, newTechId, type UserEdits } from './edit'
 
-// ───── 数据与布局 ─────
-const { placed, eraRadii, eraY, towerHeight } = layoutTower(TECHS)
+// 点击聚焦沿"画面上真实存在的弧线"走 1 跳：只留直接相连的上下游，配合相机取景把这一组放到画面里
+const FOCUS_HOPS = 1
 
-// 点击聚焦沿"画面上真实存在的弧线"走 2 跳：实测集大小 p50 10 / p90 39 / max 184，
-// 规模压得住，故不设限流（校验见 scripts/focus_graph_check.mjs）
-const graph = buildGraph(placed.map(p => p.node.id), placed.map(p => p.node.prereqs))
-const FOCUS_HOPS = 2
+// ───── 世界状态：数据（基础 + 用户增删）→ 布局 → 场景内容。增删后由 rebuildWorld() 整体重建 ─────
+let edits: UserEdits = loadEdits()
+let techs!: TechNode[]
+let placed!: PlacedNode[]
+let graph!: DepGraph
+let placedByIdx!: Map<string, number>
+let techById!: Map<string, TechNode>
+let eraRadii!: number[]
+let eraY!: number[]
+let towerHeight = 0
+let plan!: TourPlan
+let field!: PolyhedraField
+let edges!: ReturnType<typeof buildEdges>
+let rings: THREE.Object3D[] = []
+let nameLabels!: ReturnType<typeof buildNameLabels>
+let eraLabels!: ReturnType<typeof buildEraLabels>
 
-// 统计行随数据变化，避免写死后再也数不清
-document.getElementById('statLine')!.textContent =
-  `${TECHS.length} 项科技 · ${ERA_COUNT} 个时代 · ${CATEGORY_COUNT} 大领域`
+// 每帧复用的缓冲与掩码：尺寸随节点数变化，故在 buildWorld 里按当前规模重分配
+let nodeVis!: Uint8Array
+let edgeActive!: Uint8Array
+let focusBuf!: Int8Array
+let nameIdx!: Int32Array
+let nameAlpha!: Float32Array
+let focusDepth: Int8Array | null = null
+let selected: number | null = null
+let hoverIdx: number | null = null
 
-// ───── 场景 ─────
-const { scene, camera, renderer } = createScene(towerHeight, eraRadii)
+const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches
+if (IS_TOUCH) {
+  document.getElementById('hint')!.textContent =
+    '单指旋转 · 双指缩放与平移 · 点按节点查看详情 · 漫游中点按画面退出'
+}
 
-const field = new PolyhedraField(
-  placed,
-  CATEGORY_HEX.map(h => new THREE.Color(h))
-)
-field.meshes.forEach(m => scene.add(m))
+// ───── 场景（只建一次；里面的世界内容由 buildWorld 负责换血） ─────
+const { scene, camera, renderer } = createScene(0)
 
-const { rings } = buildEraRings(eraRadii, eraY)
-rings.forEach(r => scene.add(r))
+/** 释放上一套世界内容。注意多面体几何是模块级共享的，不能跟着一起销毁 */
+function disposeObjects(objs: THREE.Object3D[], disposeGeometry = true) {
+  for (const o of objs) {
+    o.parent?.remove(o)
+    o.traverse(c => {
+      const m = c as THREE.Mesh
+      if (disposeGeometry && m.geometry) m.geometry.dispose()
+      const mats = Array.isArray(m.material) ? m.material : m.material ? [m.material] : []
+      for (const mat of mats) {
+        // 名称/时代名的贴图是每套世界现画的 canvas 纹理，必须一并释放
+        const rec = mat as unknown as Record<string, { dispose?: () => void } | undefined>
+        for (const key of ['map', 'alphaMap', 'normalMap']) rec[key]?.dispose?.()
+        mat.dispose()
+      }
+    })
+  }
+}
 
-const nameLabels = buildNameLabels(placed)
-nameLabels.meshes.forEach(m => scene.add(m))
+/**
+ * 按当前 techs 重建全部世界内容：布局、依赖图、多面体、环、名称、时代名、连线、漫游排期。
+ * 新增/删除节点后调用，是"数据变了画面就跟着变"的唯一入口。
+ */
+function buildWorld() {
+  disposeObjects(field ? field.meshes : [], false)
+  disposeObjects(rings)
+  disposeObjects(nameLabels ? nameLabels.meshes : [])
+  disposeObjects(eraLabels ? eraLabels.meshes : [])
+  if (edges) disposeObjects([edges.lines])
 
-// 时代名标签：每个时代名拆成单字，沿该层圆环外沿固定方位弧形排布
-const eraLabels = buildEraLabels(eraRadii, eraY)
-eraLabels.meshes.forEach(m => scene.add(m))
+  techs = applyEdits(TECHS, edits)
+  const layout = layoutTower(techs)
+  placed = layout.placed
+  eraRadii = layout.eraRadii
+  eraY = layout.eraY
+  towerHeight = layout.towerHeight
+  graph = buildGraph(placed.map(p => p.node.id), placed.map(p => p.node.prereqs))
+  placedByIdx = new Map(placed.map((p, i) => [p.node.id, i]))
+  techById = new Map(placed.map(p => [p.node.id, p.node]))
 
-// ───── 相机与漫游排期 ─────
-const plan = new TourPlan(placed, eraRadii, eraY)
+  nodeVis = new Uint8Array(placed.length).fill(1)
+  edgeActive = new Uint8Array(placed.length).fill(1)
+  focusBuf = new Int8Array(placed.length)
+  nameIdx = new Int32Array(placed.length)
+  nameAlpha = new Float32Array(placed.length)
+
+  field = new PolyhedraField(placed, CATEGORY_HEX.map(h => new THREE.Color(h)))
+  field.meshes.forEach(m => scene.add(m))
+
+  const built = buildEraRings(eraRadii, eraY)
+  rings = built.rings
+  rings.forEach(r => scene.add(r))
+
+  nameLabels = buildNameLabels(placed)
+  nameLabels.meshes.forEach(m => scene.add(m))
+
+  eraLabels = buildEraLabels(eraRadii, eraY)
+  eraLabels.meshes.forEach(m => scene.add(m))
+
+  plan = new TourPlan(placed, eraRadii, eraY)
+
+  // 连线要在漫游中按显现时刻生长，故依赖 plan 的 revealAt
+  edges = buildEdges(placed, plan.revealAt)
+  scene.add(edges.lines)
+}
+
+buildWorld()
 const rig = new CameraRig(camera, renderer.domElement, eraRadii, towerHeight, plan)
-
-// 连线要在漫游中按显现时刻生长，故依赖 plan 的 revealAt
-const edges = buildEdges(placed, plan.revealAt)
-scene.add(edges.lines)
 
 // ───── UI：图例（领域可隐藏）+ 名称显示上限 ─────
 const legend = document.getElementById('legend')!
-const catCount = CATEGORY_NAMES.map((_, i) => placed.filter(p => p.node.category === i).length)
+let labelLimit = 100 // 名称显示上限；图例里的滑杆会改它
 const IMPLbl = ['基石', '领域支柱', '领域内重要', '改良与细分', '长尾补充']
-legend.innerHTML = `
+const KINDS = ['原理', '工艺', '器物', '制度', '媒介'] as const
+
+/** 图例整块重建：领域与重要度的计数随增删变化，不能只写死一次 */
+function buildLegend() {
+  const catCount = CATEGORY_NAMES.map((_, i) => placed.filter(p => p.node.category === i).length)
+  legend.innerHTML = `
   <div class="lg-head"><div class="lg-title">领域图例</div>
-    <button class="lg-toggle" id="legendToggle" title="折叠/展开图例">▾</button></div>
+    <button class="lg-toggle" id="legendToggle" title="折叠/展开图例">${legend.classList.contains('collapsed') ? '▸' : '▾'}</button></div>
   <div class="lg-body">
   ${['A', 'B', 'C', 'D'].map(g => `
     <button class="lg-group" data-group="${g}" title="整组开关：组内有隐藏时全显，否则全隐">${GROUP_NAMES[g]}<i>▾</i></button>
@@ -76,38 +150,31 @@ legend.innerHTML = `
   <div class="lg-sep"></div>
   <div class="lg-title">名称显示上限</div>
   <div class="lg-limit">
-    <input type="range" id="labelLimitRange" min="0" max="${TECHS.length}" step="1" value="100">
-    <span id="labelLimitValue">100</span>
+    <input type="range" id="labelLimitRange" min="0" max="${techs.length}" step="1" value="${labelLimit}">
+    <span id="labelLimitValue">${labelLimit}</span>
   </div>
   <div class="lg-hint">按到相机距离显示最近的名称</div>
   <div class="lg-sep"></div>
   <div class="lg-title">副轴 kind（规范 §3：筛选与文案）</div>
-  <div class="lg-kinds" id="kindFilter"></div>
+  <div class="lg-kinds" id="kindFilter">
+  ${KINDS.map(k => `<button class="lg-kind" data-kind="${k}">${k}<b>${placed.filter(p => p.node.kind === k).length}</b></button>`).join('')}
+  </div>
   <div class="lg-hint">点选即筛选：隐去节点、连线与名称，不动位置</div>
   </div>
 `
-// 图例折叠：只留标题行，把画面让给塔身
-const legendToggle = document.getElementById('legendToggle') as HTMLButtonElement
-legendToggle.addEventListener('click', () => {
-  const collapsed = legend.classList.toggle('collapsed')
-  legendToggle.textContent = collapsed ? '▸' : '▾'
-})
+}
+buildLegend()
+// 小屏默认折叠图例：手机上展开态会盖住半个画面
+if (window.matchMedia('(max-width: 720px)').matches) {
+  legend.classList.add('collapsed')
+  buildLegend()
+}
 
 // ───── 可见性状态：领域掩码 ∧ kind 掩码 ∧ 重要度独显 + 点击聚焦，三处渲染共用一次下发 ─────
 const hiddenCats = new Set<number>()
 const activeKinds = new Set<string>()
 let soloImp: number | null = null // 独显某档重要度（null = 不限档）
-let selected: number | null = null
-const focusBuf = new Int8Array(placed.length)
-let focusDepth: Int8Array | null = null
-const nodeVis = new Uint8Array(placed.length).fill(1) // 1 = 在场（未被隐藏）
-const edgeActive = new Uint8Array(placed.length).fill(1) // 在场且在聚焦集内 → 连线遮罩
 const isVisible = (i: number) => nodeVis[i] > 0
-
-const kindFilter = document.getElementById('kindFilter')!
-const KINDS = ['原理', '工艺', '器物', '制度', '媒介'] as const
-kindFilter.innerHTML = KINDS.map((k, i) =>
-  `<button class="lg-kind" data-kind="${k}">${k}<b>${placed.filter(p => p.node.kind === k).length}</b></button>`).join('')
 
 // 域群 → 该组下的领域索引。键必须是 categories.json 的组字母（A/B/C/D），
 // 图例的 data-group 用的就是这个字母
@@ -128,8 +195,35 @@ function syncPanelState() {
   document.getElementById('catReset')!.classList.toggle('idle', hiddenCats.size === 0 && soloImp === null)
   legend.querySelectorAll('.lg-imp').forEach(el =>
     el.classList.toggle('on', Number((el as HTMLElement).dataset.level) === soloImp))
-  kindFilter.querySelectorAll('.lg-kind').forEach(el =>
+  legend.querySelectorAll('.lg-kind').forEach(el =>
     el.classList.toggle('on', activeKinds.has((el as HTMLElement).dataset.kind!)))
+}
+
+// ───── URL hash 状态：#n=<id>&hide=<领域>&imp=<档>&k=<kind>，当前视图可直接分享 ─────
+function syncHash() {
+  const p = new URLSearchParams()
+  if (selected !== null) p.set('n', placed[selected].node.id)
+  if (hiddenCats.size) p.set('hide', [...hiddenCats].sort((a, b) => a - b).join(','))
+  if (soloImp !== null) p.set('imp', String(soloImp))
+  if (activeKinds.size) p.set('k', [...activeKinds].join(','))
+  const s = p.toString()
+  history.replaceState(null, '', s ? `#${s}` : location.pathname + location.search)
+}
+
+/** 从 URL hash 恢复筛选与聚焦，返回 hash 指定的节点索引（无则 null） */
+function restoreFromHash(): number | null {
+  const h = new URLSearchParams(location.hash.slice(1))
+  h.get('hide')?.split(',').forEach(s => {
+    const n = Number(s)
+    if (Number.isInteger(n) && n >= 0 && n < CATEGORY_COUNT) hiddenCats.add(n)
+  })
+  const imp = Number(h.get('imp'))
+  if (imp >= 1 && imp <= 5) soloImp = imp
+  h.get('k')?.split(',').forEach(k => {
+    if ((KINDS as readonly string[]).includes(k)) activeKinds.add(k)
+  })
+  const nid = h.get('n')
+  return nid ? placedByIdx.get(nid) ?? null : null
 }
 
 function applyVisualState() {
@@ -150,10 +244,24 @@ function applyVisualState() {
   nameLabels.setFocus(focusDepth)
   edges.setActive(edgeActive)
   edges.setEmphasis(focusDepth !== null) // 聚焦时子图的线提亮
+  syncHash()
 }
 
 legend.addEventListener('click', e => {
-  const el = (e.target as HTMLElement).closest?.('.lg-cat, .lg-group, .lg-imp, .lg-reset') as HTMLElement | null
+  const t = e.target as HTMLElement
+  if (t.closest('#legendToggle')) {
+    const collapsed = legend.classList.toggle('collapsed')
+    ;(legend.querySelector('#legendToggle') as HTMLElement).textContent = collapsed ? '▸' : '▾'
+    return
+  }
+  const kindEl = t.closest('.lg-kind') as HTMLElement | null
+  if (kindEl) {
+    const k = kindEl.dataset.kind!
+    activeKinds.has(k) ? activeKinds.delete(k) : activeKinds.add(k)
+    applyVisualState()
+    return
+  }
+  const el = t.closest?.('.lg-cat, .lg-group, .lg-imp, .lg-reset') as HTMLElement | null
   if (!el) return
   if (el.classList.contains('lg-reset')) { hiddenCats.clear(); soloImp = null }
   else if (el.classList.contains('lg-imp')) {
@@ -170,19 +278,13 @@ legend.addEventListener('click', e => {
   applyVisualState()
 })
 
-kindFilter.addEventListener('click', e => {
-  const k = (e.target as HTMLElement)?.dataset?.kind
-  if (!k) return
-  activeKinds.has(k) ? activeKinds.delete(k) : activeKinds.add(k)
-  applyVisualState()
-})
-
-let labelLimit = 100
-const limitRange = document.getElementById('labelLimitRange') as HTMLInputElement
-const limitValue = document.getElementById('labelLimitValue')!
-limitRange.addEventListener('input', () => {
-  labelLimit = Number(limitRange.value)
-  limitValue.textContent = String(labelLimit)
+// 名称上限滑杆在每次重建图例时是新元素，故用委托监听
+legend.addEventListener('input', e => {
+  const t = e.target as HTMLInputElement
+  if (t.id !== 'labelLimitRange') return
+  labelLimit = Number(t.value)
+  const out = legend.querySelector('#labelLimitValue')
+  if (out) out.textContent = String(labelLimit)
 })
 
 // ───── UI：字幕 ─────
@@ -272,11 +374,89 @@ rig.onTourEnd = () => {
   btnTour.classList.remove('active')
 }
 
+// ───── UI：搜索（名称 / 英文名 / 别名），选中即聚焦并飞往节点 ─────
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
+const searchBox = document.getElementById('searchBox') as HTMLInputElement
+const searchResults = document.getElementById('searchResults')!
+let SEARCHABLE: { t: TechNode; name: string; en: string; hay: string }[] = []
+let searchHits: TechNode[] = []
+let searchActive = -1
+
+/** 搜索索引随数据重建（增删后必须重算，否则新节点搜不到、已删的还搜得着） */
+function buildSearchIndex() {
+  SEARCHABLE = placed.map(p => ({
+    t: p.node,
+    name: p.node.name.toLowerCase(),
+    en: p.node.nameEn.toLowerCase(),
+    hay: `${p.node.name} ${p.node.nameEn} ${p.node.aliases.join(' ')}`.toLowerCase(),
+  }))
+}
+
+function renderSearch() {
+  searchResults.innerHTML = searchHits.map((t, k) =>
+    `<button class="sr-item${k === searchActive ? ' on' : ''}" data-id="${esc(t.id)}"><span>${esc(t.name)}</span><i>${esc(t.nameEn)}</i><b>${'★'.repeat(6 - t.importance)}</b></button>`
+  ).join('')
+  searchResults.classList.toggle('show', searchHits.length > 0)
+}
+
+function doSearch() {
+  const q = searchBox.value.trim().toLowerCase()
+  searchActive = -1
+  if (!q) { searchHits = []; renderSearch(); return }
+  const hits: { t: TechNode; rank: number }[] = []
+  for (const s of SEARCHABLE) {
+    if (!s.hay.includes(q)) continue
+    // 前缀命中 > 名称内含 > 仅别名/组合命中；同级按重要度排
+    const rank = s.name.startsWith(q) || s.en.startsWith(q) ? 0
+      : s.name.includes(q) || s.en.includes(q) ? 1 : 2
+    hits.push({ t: s.t, rank })
+  }
+  hits.sort((a, b) => a.rank - b.rank || a.t.importance - b.t.importance || a.t.year - b.t.year)
+  searchHits = hits.slice(0, 12).map(h => h.t)
+  renderSearch()
+}
+
+function gotoTech(id: string) {
+  const idx = placedByIdx.get(id)
+  if (idx === undefined) return
+  // 目标当前被领域/kind/重要度筛掉时，先放开筛选让它可见
+  if (!nodeVis[idx]) { hiddenCats.clear(); activeKinds.clear(); soloImp = null }
+  if (selected !== idx) selectNode(idx) // selectNode 内部会把相机取景到"它 + 一跳邻居"
+  searchHits = []; renderSearch()
+  searchBox.value = ''
+  searchBox.blur()
+}
+
+searchBox.addEventListener('input', doSearch)
+searchBox.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault()
+    if (!searchHits.length) return
+    searchActive = (searchActive + (e.key === 'ArrowDown' ? 1 : -1) + searchHits.length) % searchHits.length
+    renderSearch()
+  } else if (e.key === 'Enter') {
+    const t = searchHits[searchActive >= 0 ? searchActive : 0]
+    if (t) gotoTech(t.id)
+  } else if (e.key === 'Escape') {
+    searchHits = []; renderSearch()
+    searchBox.blur()
+  }
+})
+searchResults.addEventListener('click', e => {
+  const el = (e.target as HTMLElement).closest('.sr-item') as HTMLElement | null
+  if (el) gotoTech(el.dataset.id!)
+})
+// 点搜索框之外收起结果
+document.addEventListener('pointerdown', e => {
+  if (!(e.target as HTMLElement).closest?.('#search')) { searchHits = []; renderSearch() }
+})
+
 // ───── 拾取：悬停看信息，点击锁定关联 ─────
 const tooltip = document.getElementById('tooltip')!
 const raycaster = new THREE.Raycaster()
 const ndc = new THREE.Vector2()
-let hoverIdx: number | null = null
 
 // 规范 §6：tooltip 同时显示"精确数值"与"真实精度"，避免把约定值读成确证
 function yearText(n: TechNode): string {
@@ -303,6 +483,13 @@ function pickAt(clientX: number, clientY: number): number | null {
   return null
 }
 
+/** 把相机取景到"选中节点 + 一跳邻居"这一组上（自动放大 / 自动退到能看全） */
+function focusCamera(idx: number) {
+  const pts: THREE.Vector3[] = [placed[idx].position]
+  for (const nb of graph.adj[idx]) pts.push(placed[nb].position)
+  rig.focusOnGroup(pts)
+}
+
 function selectNode(idx: number | null) {
   if (idx === null || idx === selected) {
     selected = null
@@ -310,47 +497,93 @@ function selectNode(idx: number | null) {
   } else {
     selected = idx
     focusDepth = kHopDepth(graph, idx, FOCUS_HOPS, focusBuf)
+    focusCamera(idx)
   }
   applyVisualState()
 }
 
+// 悬停/点按共用的卡片渲染；数据字段一律转义（数据来自 PR 贡献，防注入）
+function tooltipHTML(idx: number, pinned: boolean): string {
+  const n = placed[idx].node
+  // 前置科技：显示名称（最多 4 个，避免溢出）
+  const prereqNames = n.prereqs
+    .map(id => techById.get(id)?.name ?? '')
+    .filter(Boolean)
+    .slice(0, 4)
+    .map(esc)
+    .join('、')
+  const link = pinned ? '' : selected === null ? '' : selected === idx
+    ? `<div class="tt-dim">已聚焦：与其直接相连（一跳）的科技</div>`
+    : focusDepth && focusDepth[idx] >= 0
+      ? `<div class="tt-dim">在聚焦范围内（${focusDepth[idx]} 跳）</div>` : ''
+  return `
+    <div class="tt-name">${esc(n.name)}</div>
+    <div class="tt-dim">${n.nameEn !== n.name ? esc(n.nameEn) + ' · ' : ''}${yearText(n)}</div>
+    <div class="tt-dim">${ERA_INFO[n.era].name} · ${CATEGORY_NAMES[n.category]}${n.kind ? ' · ' + esc(n.kind) : ''}</div>
+    <div class="tt-dim">重要度 ${'★'.repeat(6 - n.importance)}${'☆'.repeat(n.importance - 1)}　${facesOf(n.importance)} 面</div>
+    ${prereqNames ? `<div class="tt-dim">前置：${prereqNames}</div>` : ''}
+    ${n.desc ? `<div class="tt-desc">${esc(n.desc)}</div>` : ''}
+    ${link}
+    ${n.wikiEn
+      ? `<div class="tt-src">摘要参考英文维基百科条目
+          <a href="https://en.wikipedia.org/wiki/${encodeURIComponent(n.wikiEn)}" target="_blank" rel="noopener">${esc(n.wikiEn)}</a>
+          （CC BY-SA 4.0）</div>`
+      : ''}
+    ${pinned
+      ? `<div class="tt-actions">${editMode ? `<button data-act="del">🗑 删除此节点</button>` : ''}<button data-act="focus">⌖ 聚焦关联</button><button data-act="close">✕ 关闭</button></div>`
+      : ''}
+  `
+}
+
+// 防止卡片溢出屏幕边缘（贴近右/下边缘时回收到可视区内）
+function placeTooltip(x: number, y: number) {
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight
+  tooltip.style.left = `${Math.max(8, Math.min(x + 16, innerWidth - w - 8))}px`
+  tooltip.style.top = `${Math.max(8, Math.min(y + 12, innerHeight - h - 8))}px`
+}
+
+// 触摸点按出的固定卡片：可交互（含聚焦/删除/关闭按钮），不随指针移动
+function showPinnedTooltip(idx: number, x: number, y: number) {
+  tooltip.dataset.node = placed[idx].node.id
+  tooltip.innerHTML = tooltipHTML(idx, true)
+  tooltip.classList.add('show', 'pinned')
+  placeTooltip(x, y)
+}
+
+function hidePinnedTooltip() {
+  tooltip.classList.remove('show', 'pinned')
+  delete tooltip.dataset.node
+}
+
+tooltip.addEventListener('click', e => {
+  const act = (e.target as HTMLElement).dataset?.act
+  if (!act) return
+  const id = tooltip.dataset.node
+  const idx = id ? placedByIdx.get(id) : undefined
+  if (act === 'focus' && idx !== undefined) {
+    if (selected !== idx) selectNode(idx)
+    else focusCamera(idx)
+  } else if (act === 'del' && id) {
+    deleteNode(id)
+    return
+  }
+  hidePinnedTooltip()
+})
+
 renderer.domElement.addEventListener('pointermove', e => {
   if (rig.mode === 'tour') return // 漫游中相机在动，悬停无意义
+  if (e.pointerType === 'touch') return // 触摸无悬停，点按走 pointerup 的固定卡片
+  if (tooltip.classList.contains('pinned')) return // 固定卡片不被悬停覆盖
   const idx = pickAt(e.clientX, e.clientY)
-  hoverIdx = idx
+  hoverIdx = editMode ? null : idx
   if (idx === null) {
     tooltip.classList.remove('show')
     renderer.domElement.style.cursor = ''
     return
   }
-  const n = placed[idx].node
-  // 前置科技：显示名称（最多 4 个，避免溢出）
-  const prereqNames = n.prereqs
-    .map(id => TECH_BY_ID.get(id)?.name ?? '')
-    .filter(Boolean)
-    .slice(0, 4)
-    .join('、')
-  const link = selected === null ? '' : selected === idx
-    ? `<div class="tt-dim">已聚焦：与其相连的两跳内科技</div>`
-    : focusDepth && focusDepth[idx] >= 0
-      ? `<div class="tt-dim">在聚焦范围内（${focusDepth[idx]} 跳）</div>` : ''
-  tooltip.innerHTML = `
-    <div class="tt-name">${n.name}</div>
-    <div class="tt-dim">${n.nameEn !== n.name ? n.nameEn + ' · ' : ''}${yearText(n)}</div>
-    <div class="tt-dim">${ERA_INFO[n.era].name} · ${CATEGORY_NAMES[n.category]}${n.kind ? ' · ' + n.kind : ''}</div>
-    <div class="tt-dim">重要度 ${'★'.repeat(6 - n.importance)}${'☆'.repeat(n.importance - 1)}　${facesOf(n.importance)} 面</div>
-    ${prereqNames ? `<div class="tt-dim">前置：${prereqNames}</div>` : ''}
-    ${n.desc ? `<div class="tt-desc">${n.desc}</div>` : ''}
-    ${link}
-    ${n.wikiEn
-      ? `<div class="tt-src">摘要参考英文维基百科条目
-          <a href="https://en.wikipedia.org/wiki/${encodeURIComponent(n.wikiEn)}" target="_blank" rel="noopener">${n.wikiEn}</a>
-          （CC BY-SA 4.0）</div>`
-      : ''}
-  `
-  tooltip.style.left = `${e.clientX + 16}px`
-  tooltip.style.top = `${e.clientY + 12}px`
+  tooltip.innerHTML = tooltipHTML(idx, false)
   tooltip.classList.add('show')
+  placeTooltip(e.clientX, e.clientY)
   renderer.domElement.style.cursor = 'pointer'
 })
 
@@ -360,14 +593,172 @@ renderer.domElement.addEventListener('pointerdown', e => {
   downX = e.clientX; downY = e.clientY; downT = performance.now()
 })
 renderer.domElement.addEventListener('pointerup', e => {
-  if (e.button !== 0 || rig.mode === 'tour') return
+  if (rig.mode === 'tour') return
+  if (e.pointerType !== 'touch' && e.button !== 0) return
   if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return
   if (performance.now() - downT > 400) return
-  selectNode(pickAt(e.clientX, e.clientY)) // 点空白 = 取消聚焦
+  const idx = pickAt(e.clientX, e.clientY)
+  // 触摸与编辑模式都出固定卡片：触摸无悬停；编辑模式要在卡片上拿到"删除"
+  if (editMode || e.pointerType === 'touch') {
+    if (idx !== null) showPinnedTooltip(idx, e.clientX, e.clientY)
+    else { hidePinnedTooltip(); if (selected !== null) selectNode(null) }
+    return
+  }
+  hidePinnedTooltip()
+  selectNode(idx) // 点空白 = 取消聚焦
 })
 window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && selected !== null) selectNode(null)
+  if (e.key !== 'Escape') return
+  if (tooltip.classList.contains('pinned')) { hidePinnedTooltip(); return }
+  if (selected !== null) selectNode(null)
 })
+
+// ───── UI：编辑模式（增删节点） ─────
+// 增删只改 localStorage 里叠加层，基础 data/*.json 不动；改完整体重建场景
+let editMode = false
+const btnEdit = document.getElementById('btnEdit') as HTMLButtonElement
+const editPanel = document.getElementById('editPanel')!
+const edName = document.getElementById('edName') as HTMLInputElement
+const edNameEn = document.getElementById('edNameEn') as HTMLInputElement
+const edYear = document.getElementById('edYear') as HTMLInputElement
+const edEra = document.getElementById('edEra') as HTMLSelectElement
+const edCat = document.getElementById('edCat') as HTMLSelectElement
+const edImp = document.getElementById('edImp') as HTMLSelectElement
+const edKind = document.getElementById('edKind') as HTMLSelectElement
+const edPrereq = document.getElementById('edPrereq') as HTMLSelectElement
+const edDesc = document.getElementById('edDesc') as HTMLTextAreaElement
+const edCount = document.getElementById('edCount')!
+
+edEra.innerHTML = ERA_INFO.map((e, i) => `<option value="${i}">${e.name}</option>`).join('')
+edCat.innerHTML = CATEGORY_NAMES.map((n, i) => `<option value="${i}">${n}</option>`).join('')
+edKind.innerHTML = `<option value="">（未指定）</option>` +
+  KINDS.map(k => `<option value="${k}">${k}</option>`).join('')
+edImp.innerHTML = [1, 2, 3, 4, 5].map(l =>
+  `<option value="${l}"${l === 3 ? ' selected' : ''}>${l} · ${facesOf(l)} 面 ${IMPLbl[l - 1]}</option>`).join('')
+
+// 前置候选近四千项：每次重建都塞满 option 会让 DOM 与快照体积爆炸，故改为首次展开时才填充
+let prereqDirty = true
+
+/** 真正填充前置下拉（首次展开 / 需要取值时才做） */
+function fillPrereqOptions() {
+  if (!prereqDirty || !placed) return
+  prereqDirty = false
+  const prefer = selected !== null ? placed[selected].node.id : ''
+  edPrereq.innerHTML = `<option value="">（无前置）</option>` +
+    placed.map(p => `<option value="${esc(p.node.id)}">${esc(p.node.name)}</option>`).join('')
+  if (prefer && placedByIdx.has(prefer)) edPrereq.value = prefer
+}
+
+/** 数据重建后：把下拉退回"未填充"占位，等用户展开再灌 */
+function markPrereqDirty() {
+  prereqDirty = true
+  edPrereq.innerHTML = `<option value="">（展开后可选 ${placed ? placed.length : 0} 项）</option>`
+}
+
+edPrereq.addEventListener('pointerdown', fillPrereqOptions)
+edPrereq.addEventListener('focus', fillPrereqOptions)
+edPrereq.addEventListener('click', fillPrereqOptions)
+
+function setEditMode(on: boolean) {
+  editMode = on
+  btnEdit.classList.toggle('active', on)
+  editPanel.classList.toggle('hidden', !on)
+  document.body.classList.toggle('editing', on)
+  if (on) {
+    hidePinnedTooltip()
+    // 编辑时不需要聚焦高亮干扰判断，先解除
+    if (selected !== null) selectNode(null)
+  }
+  hoverIdx = null
+  tooltip.classList.remove('show')
+}
+btnEdit.addEventListener('click', () => setEditMode(!editMode))
+document.getElementById('edClose')!.addEventListener('click', () => setEditMode(false))
+
+/** 删除一个节点：新增的从叠加层摘掉，基础数据的记进删除集 */
+function deleteNode(id: string) {
+  if (edits.added.some(n => n.id === id)) {
+    edits.added = edits.added.filter(n => n.id !== id)
+  } else if (!edits.deleted.includes(id)) {
+    edits.deleted.push(id)
+  }
+  saveEdits(edits)
+  hidePinnedTooltip()
+  rebuildAfterDataChange(null)
+}
+
+document.getElementById('edAdd')!.addEventListener('click', () => {
+  const name = edName.value.trim()
+  const nameEn = edNameEn.value.trim()
+  if (!name && !nameEn) { edName.focus(); return }
+  const year = Number(edYear.value)
+  const prereq = edPrereq.value
+  const node: TechNode = {
+    id: newTechId(),
+    name: name || nameEn,
+    nameEn: nameEn || name,
+    wikiEn: '',
+    aliases: [],
+    year: Number.isFinite(year) ? year : 0,
+    yearBasis: 'exact',
+    yearNote: '应用内新增',
+    kind: edKind.value,
+    era: Number(edEra.value),
+    category: Number(edCat.value),
+    importance: Number(edImp.value),
+    prereqs: prereq && placedByIdx.has(prereq) ? [prereq] : [],
+    related: [],
+    desc: edDesc.value.trim(),
+  }
+  edits.added.push(node)
+  saveEdits(edits)
+  edName.value = ''
+  edNameEn.value = ''
+  edDesc.value = ''
+  rebuildAfterDataChange(node.id) // 重建后把相机飞到新节点，立刻看到它落在哪
+})
+
+document.getElementById('edRestore')!.addEventListener('click', () => {
+  if (!hasEdits(edits)) return
+  edits = emptyEdits()
+  clearEdits()
+  rebuildAfterDataChange(null)
+})
+
+/** 界面里随数据变化的那些计数与索引 */
+function refreshInterface() {
+  document.getElementById('statLine')!.textContent =
+    `${techs.length} 项科技 · ${ERA_COUNT} 个时代 · ${CATEGORY_COUNT} 大领域`
+  buildLegend()
+  buildSearchIndex()
+  markPrereqDirty()
+  edCount.textContent = hasEdits(edits)
+    ? `已添加 ${edits.added.length} 项（绿框）· 已删除 ${edits.deleted.length} 项`
+    : '当前为调研原始数据'
+  edCount.classList.toggle('dirty', hasEdits(edits))
+}
+
+/** 增删之后：重建世界 → 让相机认新布局 → 清残留状态 → 重新下发掩码 */
+function rebuildAfterDataChange(focusId: string | null) {
+  if (rig.mode === 'tour') rig.stopTour() // 漫游中改数据会打架，先退出
+  buildWorld()
+  rig.setLayout(eraRadii, towerHeight, plan)
+  hoverIdx = null
+  selected = null
+  focusDepth = null
+  shownEra = -2
+  searchHits = []
+  hidePinnedTooltip()
+  refreshInterface()
+  applyVisualState()
+  rig.resetView()
+  showEraStage(ERA_COUNT - 1)
+  nameLabels.invalidate()
+  if (focusId !== null) {
+    const idx = placedByIdx.get(focusId)
+    if (idx !== undefined) selectNode(idx)
+  }
+}
 
 // ───── 自适应窗口 ─────
 function refreshView() {
@@ -381,11 +772,17 @@ window.addEventListener('resize', refreshView)
 
 // ───── 主循环 ─────
 const clock = new THREE.Clock()
-const nameIdx = new Int32Array(placed.length)
-const nameAlpha = new Float32Array(placed.length)
 
 // 首帧前把掩码下发一遍：面板初始态（"全部显示"是否可点）也在这里对齐
-applyVisualState()
+// 先恢复 URL hash 里的分享状态（筛选 + 聚焦节点），再统一下发
+refreshInterface()
+const hashSelected = restoreFromHash()
+if (hashSelected !== null) {
+  selected = hashSelected
+  focusDepth = kHopDepth(graph, hashSelected, FOCUS_HOPS, focusBuf)
+}
+applyVisualState() // 若 hash 所选节点被 hash 里的筛选隐去，会在这里自动解除聚焦
+if (selected !== null) focusCamera(selected)
 
 function loop() {
   requestAnimationFrame(loop)
