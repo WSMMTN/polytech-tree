@@ -1,0 +1,59 @@
+name: 构建 iOS 未签名 .ipa
+
+# 只在手动触发时运行：产出物是未签名包，需要自己用 Sideloadly 现签才能装机
+on:
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    # 必须用 macOS runner：.ipa 里的 ARM64 二进制只能由 Xcode 工具链编译
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # 单文件构建：确保打进 WebView 的是最新版（一跳聚焦 + 节点增删）
+      - run: npm run build:single
+
+      - run: npx cap sync ios
+
+      # Capacitor 8 走 Swift Package Manager，先解析本地包再归档
+      - name: 解析 Swift Package 依赖
+        run: xcodebuild -resolvePackageDependencies -project ios/App/App.xcodeproj -scheme App
+
+      # CODE_SIGNING_ALLOWED=NO：runner 上没有证书，只能产出未签名 .app
+      - name: 归档（不签名）
+        run: |
+          xcodebuild archive \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      # 未签名时 -exportArchive 会失败，改为手工组 Payload 再压缩成 .ipa
+      - name: 包装成 .ipa
+        run: |
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" \
+                "$RUNNER_TEMP/ipa/Payload/App.app"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry PolytechTree-unsigned.ipa Payload
+          ls -lh PolytechTree-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PolytechTree-ios-unsigned-ipa
+          path: ${{ runner.temp }}/ipa/PolytechTree-unsigned.ipa
+          if-no-files-found: error
