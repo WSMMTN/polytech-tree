@@ -1,4 +1,4 @@
-# 依赖与构建产物
+﻿# 依赖与构建产物
 node_modules/
 dist/
 
@@ -49,4 +49,3 @@ data/adjud/metrics.json
 # 代理自测产生的裁决分片，不是真实裁决
 data/adjud/*.selftest.json
 
-supabase/.temp/

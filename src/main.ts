@@ -27,7 +27,7 @@ setActiveDataset(datasetId) // 必须早于 buildWorld() 与任何布局/UI 读�
 
 // ───── 世界状态：数据（基础 + 用户增删）→ 布局 → 场景内容。增删后由 rebuildAfterDataChange() 整体重建 ─────
 let edits: UserEdits = loadEdits(datasetId)
-// 社区层（Supabase）。未配置后端时 COMMUNITY_ENABLED=false，相关调用全部短路，
+// 社区层（CloudBase）。未配置后端时 COMMUNITY_ENABLED=false，相关调用全部短路，
 // 行为与纯本地版本完全一致
 let communityEdits: UserEdits = emptyEdits()
 let communityIds: Set<string> = new Set()
@@ -1093,8 +1093,8 @@ async function applyDataset(id: DatasetId) {
   syncHash()
 }
 
-// ───── 社区层接线（Supabase）─────
-// 只有配好 src/community/config.ts 里的 URL + anon key 才会真正加载 src/community；
+// ───── 社区层接线（CloudBase）─────
+// 只有配好 src/community/config.ts 里的 TCB_API_BASE 才会真正加载 src/community；
 // 没配时 COMMUNITY_ENABLED=false，communityApi 恒为 null，所有上报/订阅都是空操作。
 
 /** 重拉社区层并重建画面。网络异常时保留上一次的社区层，不把画面清空 */

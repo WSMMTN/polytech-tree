@@ -1,23 +1,17 @@
 -- ============================================================================
--- 0001_community_edit.sql —— 社区编辑后端（Supabase / Postgres）
+-- community_edit —— 社区编辑后端（腾讯云 CloudBase PostgreSQL 版）
 --
--- 设计（与前端 src/community/* 一一对应）：
---   * edit_log 是唯一事实源，append-only。公开角色只能 INSERT + SELECT，
---     没有任何 UPDATE/DELETE 策略 —— 破坏者写进去的东西只能被管理员逐行抹掉。
---   * 叠加层不需要额外的物化表：前端拉回整条日志在本地回放（fetchCommunity），
---     op=add/update/delete/color 按 seq 顺序叠加，即得到最终的社区层。
---   * 校验 / 限流 / 熔断全部在 BEFORE INSERT 触发器里做，客户端只负责发一条记录。
---   * IP、UA、签名等敏感指纹单独存 edit_meta（公开角色读不到），
---     edit_log 本体不含任何隐私字段 —— 这样 Realtime 广播也安全。
---   * 人机验证 + 服务端签名 token 由 supabase/functions/write 完成（需要 SECRET，
---     不能放前端）；启用后把 direct_writes 置 false，匿名直连就被封死。
---   * 管理端（回退 / 暂停）走 supabase/functions/admin（service_role），
---     ADMIN_SECRET 只存在于 Edge Function 的环境变量里。
---
--- 执行方式：Supabase Dashboard → SQL Editor 整段执行，或 `supabase db push`。
+-- 由 supabase/migrations/0001_community_edit.sql 适配而来，差异：
+--   * CloudBase 的 HTTP API 就是 PostgREST，且 anon/authenticated/service_role
+--     角色名与 Supabase 一致，RLS / 触发器 / 护栏全部原样可用。
+--   * 去掉 pgcrypto（md5 是 PG 内置函数，用不到扩展）。
+--   * Realtime 不可用时前端退化为轮询（客户端侧处理），publication 段保留容错。
+--   * 管理端不依赖 Edge Function：新增 admin_action(p_secret, p_action, p_params)
+--     分发 RPC，内部比对 app_secrets.admin_secret 后调用各 admin_* 函数，
+--     前端 /admin 页直接以 anon 身份调它（密钥是唯一防线）。
+--   * ip_salt / admin_secret 在此为占位值，部署后用 tcb db execute 改成随机串
+--     （真值绝不进 git）。
 -- ============================================================================
-
-create extension if not exists pgcrypto;
 
 -- ── 配置表：开关 / 阈值 / 白名单 / 枚举（公开可读，只有 service_role 能改） ──────
 create table if not exists public.community_config (
@@ -29,8 +23,7 @@ create table if not exists public.community_config (
 insert into public.community_config(key, value) values
   -- 全局暂停写入。置 true 后所有 INSERT 一律被触发器拒绝（管理员可随时开关）
   ('writes_paused', 'false'::jsonb),
-  -- true = 允许匿名用 anon key 直连 PostgREST 写入；
-  -- 启用 Turnstile / 签名 token 后必须置 false，强制所有写入经 Edge Function
+  -- true = 允许匿名直连 PostgREST 写入；CloudBase 版没有 Edge Function 写路径，保持 true
   ('direct_writes', 'true'::jsonb),
   -- 限流与熔断阈值
   ('limits', '{
@@ -41,7 +34,7 @@ insert into public.community_config(key, value) values
   }'::jsonb),
   -- 核心节点 id：禁止删除（与 data/core-ids.json 同步；改动数据后请重新生成这一段）
   ('protected_ids', '["fire","stone_tools","clothing","bow_and_arrow","language","boat_canoe","agriculture","irrigation","pottery","animal_husbandry","weaving_loom","plow","fermentation","sail","cuneiform_writing","bronze_metallurgy","wheel_axle","mathematics_early","glassmaking","chariot","iron_smelting","alphabet","papermaking","aqueduct","roman_concrete","geometry_deductive","seismoscope","gunpowder","compass_navigation","woodblock_printing","mechanical_clock","paper_money","blast_furnace","windmill","horse_collar","movable_type_printing","telescope","microscope","heliocentric_model","logarithm","barometer","calculus","steam_engine","spinning_jenny","power_loom","railway_locomotive","telegraph","photography","bessemer_steel","electricity_generation","incandescent_lamp","telephone","radio","internal_combustion_engine","automobile","airplane","assembly_line","alternating_current","dynamite","refrigeration","penicillin","jet_engine","nuclear_reactor","transistor","electronic_computer","stored_program_computer","dna_double_helix","artificial_satellite","rocket_engine","oral_contraceptive","laser","microprocessor","personal_computer","internet","world_wide_web","email","mobile_phone","fiber_optics_comm","lcd_display","smartphone","deep_learning","crispr_gene_editing","reusable_rocket","human_genome_project","cloud_computing","mrna_vaccine","large_language_model","electric_vehicle"]'::jsonb),
-  -- 枚举白名单（规则同 scripts/validate_data.py）：新增/修改只接受这些值
+  -- 枚举白名单（与 scripts/validate_data.py 保持一致）
   ('enums', '{
     "eras": ["prehistory","neolithic","bronze_age","antiquity","middle_ages","renaissance","industrial","second_industrial","atomic_electronic","information","intelligent"],
     "categories": ["math_pure","logic_foundations","algorithms_cs","computing_systems","info_media","physics","chemistry","life_medicine","earth_space","materials","manufacturing","energy_power","construction","transport","agriculture_food","military","space_exploration","governance","economy","education_knowledge","culture_media","daily_life"],
@@ -55,12 +48,12 @@ create table if not exists public.app_secrets (
   key   text primary key,
   value text not null
 );
--- ip_salt：IP/UA 指纹的加盐值，避免被彩虹表反查。部署后请改成随机串。
+-- ip_salt：IP/UA 指纹的加盐值，避免被彩虹表反查。部署后改成随机串。
+-- admin_secret：管理端密钥（admin_action RPC 校验用）。部署后改成随机长串。
 insert into public.app_secrets(key, value) values
-  ('ip_salt', 'CHANGE-ME-polytech-tree-salt')
+  ('ip_salt', 'CHANGE-ME-polytech-tree-salt'),
+  ('admin_secret', 'CHANGE-ME-admin-secret')
 on conflict (key) do nothing;
--- 若要启用服务端签名 token，再插入（Edge Function write 会用同一个值算 HMAC）：
---   insert into public.app_secrets(key, value) values ('token_secret', '<随机长串>');
 
 -- ── 日志表：唯一事实源，append-only ──────────────────────────────────────────
 create table if not exists public.edit_log (
@@ -83,8 +76,7 @@ create table if not exists public.edit_meta (
   created_at  timestamptz not null default now(),
   ip_hash     text,
   ua_hash     text,
-  -- 匿名作者指纹：默认等于 ip_hash；经 Edge Function 写入时可换成 token 指纹。
-  -- 「按作者回退」就靠这一列
+  -- 匿名作者指纹：默认等于 ip_hash。「按作者回退」就靠这一列
   author_hash text,
   sig         text,
   issued_at   timestamptz
@@ -259,12 +251,12 @@ begin
     raise exception '社区写入当前已暂停（管理员关闭中）' using errcode = '55000';
   end if;
 
-  -- 2) 关闭直连后，只有 service_role（即 Edge Function）能写。
-  --    role 取不到 = SQL 直连/迁移脚本，视为运维操作放行
+  -- 2) 预留的服务端写入开关（CloudBase 版保持 direct_writes=true，此分支不生效；
+  --    role 取不到 = SQL 直连/迁移脚本，视为运维操作放行）
   role_txt := public.request_role();
   if not public.cfg_bool('direct_writes', true)
      and role_txt <> '' and role_txt <> 'service_role' then
-    raise exception '社区写入必须经服务端（Edge Function）提交' using errcode = '42501';
+    raise exception '社区写入必须经服务端提交' using errcode = '42501';
   end if;
 
   -- 3) 结构校验 + 核心节点禁删
@@ -310,9 +302,7 @@ create trigger edit_log_guard_trg
 
 -- ============================================================================
 -- 指纹落库：AFTER INSERT
--- IP / UA / 签名不能挂在 edit_log 上（那会让 Realtime 把它们广播出去），
--- 单独落到 edit_meta —— 公开角色对它没有任何策略，一行都读不到。
--- 经 Edge Function 写入时，它可以用 service_role 再回填 author_hash / sig / issued_at。
+-- IP / UA 不挂在 edit_log 上，单独落到 edit_meta —— 公开角色对它没有任何策略。
 -- ============================================================================
 create or replace function public.edit_meta_write()
 returns trigger
@@ -330,7 +320,7 @@ begin
     new.created_at,
     ip_h,
     public.salted_hash(hdrs ->> 'user-agent'),
-    -- 未启用 token 时，作者指纹退化为 IP 指纹（仅够用于"按来源回退"）
+    -- 作者指纹退化为 IP 指纹（仅够用于"按来源回退"）
     ip_h
   )
   on conflict (seq) do nothing;
@@ -371,7 +361,7 @@ grant select on public.community_config to anon, authenticated;
 -- edit_meta / app_secrets 不 grant —— RLS 之外再加一道
 
 -- ============================================================================
--- Realtime：让前端订阅新改动（edit_log 上有 select 策略，已满足）
+-- Realtime：CloudBase 版前端用轮询，不依赖发布；此处仅容错尝试
 -- ============================================================================
 do $$
 begin
@@ -384,9 +374,8 @@ begin
 end $$;
 
 -- ============================================================================
--- 回退 / 运维函数（只有 service_role 能执行）
--- 四种粒度：单条 / 按作者 / 按时间点 / 全局。均由 Edge Function admin 用
--- service_role key 调用，前端拿不到这些能力。
+-- 回退 / 运维函数（只有 service_role 与 admin_action 分发器能执行）
+-- 四种粒度：单条 / 按作者 / 按时间点 / 全局。
 -- ============================================================================
 
 /** 回退单条社区改动（某人把某节点改坏了，只抹这一笔） */
@@ -456,21 +445,75 @@ language sql stable security definer set search_path = public, pg_temp as $$
    limit greatest(1, least(coalesce(p_limit, 100), 1000));
 $$;
 
--- PostgreSQL 默认把 EXECUTE 授给 PUBLIC：先收回，再只给 service_role
+/**
+ * 管理动作分发器（CloudBase 版替代 Edge Function admin）：
+ * 前端 /admin 页以 anon 身份调它，唯一防线是 app_secrets.admin_secret。
+ * 密钥只存在这张表里与用户手输的 sessionStorage，绝不进前端构建产物。
+ */
+create or replace function public.admin_action(
+  p_secret text, p_action text, p_params jsonb default '{}'::jsonb
+) returns jsonb
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  real_secret text;
+  n           integer;
+begin
+  select value into real_secret from public.app_secrets where key = 'admin_secret';
+  if real_secret is null or real_secret like 'CHANGE-ME%'
+     or coalesce(p_secret, '') = '' or p_secret <> real_secret then
+    raise exception '管理密钥错误或尚未配置' using errcode = '42501';
+  end if;
+
+  case p_action
+    when 'status' then
+      return (select coalesce(jsonb_object_agg(key, value), '{}'::jsonb) from public.community_config);
+    when 'list' then
+      return (select coalesce(jsonb_agg(t), '[]'::jsonb) from (
+        select seq, created_at, op, entity, target_id, payload, author_hash
+          from public.admin_recent_edits(greatest(1, least(coalesce((p_params ->> 'limit')::int, 100), 1000)))
+        -- 上面的返回列顺序即 JSON 键序；再按 seq 倒序包一层保证输出有序
+        order by seq desc
+      ) t);
+    when 'rollback_row' then
+      n := public.admin_rollback_row((p_params ->> 'seq')::bigint);
+      return to_jsonb(n);
+    when 'rollback_author' then
+      n := public.admin_rollback_author(p_params ->> 'author_hash');
+      return to_jsonb(n);
+    when 'rollback_since' then
+      n := public.admin_rollback_since((p_params ->> 'ts')::timestamptz);
+      return to_jsonb(n);
+    when 'reset_all' then
+      n := public.admin_reset_all();
+      return to_jsonb(n);
+    when 'pause' then
+      perform public.admin_set_paused(true);
+      return 'true'::jsonb;
+    when 'resume' then
+      perform public.admin_set_paused(false);
+      return 'false'::jsonb;
+    else
+      raise exception '未知管理动作：%', p_action using errcode = '22023';
+  end case;
+end $$;
+
+-- PostgreSQL 默认把 EXECUTE 授给 PUBLIC：先收回，再按需授权
 revoke execute on function public.admin_rollback_row(bigint)        from public, anon, authenticated;
 revoke execute on function public.admin_rollback_author(text)       from public, anon, authenticated;
 revoke execute on function public.admin_rollback_since(timestamptz) from public, anon, authenticated;
 revoke execute on function public.admin_reset_all()                 from public, anon, authenticated;
 revoke execute on function public.admin_set_paused(boolean)         from public, anon, authenticated;
 revoke execute on function public.admin_recent_edits(integer)       from public, anon, authenticated;
+revoke execute on function public.admin_action(text, text, jsonb)   from public, anon, authenticated;
 grant execute on function public.admin_rollback_row(bigint)        to service_role;
 grant execute on function public.admin_rollback_author(text)       to service_role;
 grant execute on function public.admin_rollback_since(timestamptz) to service_role;
 grant execute on function public.admin_reset_all()                 to service_role;
 grant execute on function public.admin_set_paused(boolean)         to service_role;
 grant execute on function public.admin_recent_edits(integer)       to service_role;
+-- admin_action 内部自校验密钥，anon 可调用（否则 /admin 页进不了门）
+grant execute on function public.admin_action(text, text, jsonb)   to anon, authenticated;
 
 -- ============================================================================
--- 备份：Supabase Dashboard → Database → Backups 打开每日备份即可；
--- 也可加一条 pg_cron 每天把 edit_log 导出到 Storage 留一份冷备。
+-- 备份：CloudBase 控制台 → 数据库 → 备份；迁移后请确认备份策略已开启。
 -- ============================================================================

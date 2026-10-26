@@ -2,9 +2,10 @@
 //
 // 三件事：看（最近改动列表）、抹（单条 / 按作者 / 按时间点 / 全局重置）、停（暂停写入）。
 // 真正的权限在服务端：ADMIN_SECRET 只在本页手输、只存 sessionStorage、绝不进构建产物；
-// 所有动作都由 supabase/functions/admin 用 service_role 执行，前端拿不到任何提权能力。
+// 所有动作都由数据库 admin_action RPC 在校验密钥后执行，前端拿不到任何提权能力。
 import './admin.css'
-import { SUPABASE_URL, COMMUNITY_ENABLED } from './community/config'
+import { COMMUNITY_ENABLED } from './community/config'
+import { tcbFetch } from './community/tcb-auth'
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 
@@ -55,17 +56,16 @@ function setState(text: string, kind: '' | 'ok' | 'err') {
   elState.className = `state${kind ? ' ' + kind : ''}`
 }
 
-/** 调一次管理端 Edge Function */
+/** 调一次管理端 RPC：admin_action 在库内自校验密钥后分发动作 */
 async function callAdmin(action: string, extra: Record<string, unknown> = {}): Promise<Res> {
   try {
-    const r = await fetch(`${SUPABASE_URL}/functions/v1/admin`, {
+    const r = await tcbFetch('/v1/rdb/rest/rpc/admin_action', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-admin-secret': secret },
-      body: JSON.stringify({ action, ...extra }),
+      body: JSON.stringify({ p_secret: secret, p_action: action, p_params: extra }),
     })
     const j = await r.json().catch(() => ({} as Record<string, unknown>))
-    if (!r.ok || j.error) return { ok: false, error: String(j.error ?? `HTTP ${r.status}`) }
-    return { ok: true, result: j.result }
+    if (!r.ok) return { ok: false, error: String((j as { message?: unknown }).message ?? `HTTP ${r.status}`) }
+    return { ok: true, result: j }
   } catch (e) {
     return { ok: false, error: `请求失败：${e}` }
   }
@@ -190,7 +190,7 @@ if (!COMMUNITY_ENABLED) {
   elConnect.disabled = true
   elSecret.disabled = true
   elHint.textContent =
-    '还没配置后端：先在 src/community/config.ts 填好 SUPABASE_URL 与 anon key，并部署 supabase/functions/admin。'
+    '还没配置后端：先在 src/community/config.ts 填好 TCB_API_BASE，并执行 cloudbase/migrations 建库。'
 } else {
   try { secret = sessionStorage.getItem(SECRET_KEY) ?? '' } catch { secret = '' }
   elHint.textContent = COMMUNITY_HINT
