@@ -1,8 +1,10 @@
 // 应用内节点增删：不写回仓库的 data/*.json，只把用户的增删作为"叠加层"存在 localStorage。
 // 于是基础数据始终是唯一事实源，一键恢复默认即可回到调研产物。
-import type { TechNode } from './data'
+import type { TechNode, DatasetId } from './data'
 
-const KEY = 'polytech-tree:edits:v1'
+// 每个数据集一份存档：两棵树的 era/category 索引空间不同（人类树 11 时代 / 群星 6 层级），
+// 共用一份会让人类树里新建的 era=9 节点切到群星树时索引越界崩溃
+const keyOf = (dataset: DatasetId) => `polytech-tree:edits:${dataset}:v1`
 
 export interface UserEdits {
   added: TechNode[]
@@ -13,9 +15,9 @@ export interface UserEdits {
 
 export const emptyEdits = (): UserEdits => ({ added: [], deleted: [], colors: {} })
 
-export function loadEdits(): UserEdits {
+export function loadEdits(dataset: DatasetId): UserEdits {
   try {
-    const raw = localStorage.getItem(KEY)
+    const raw = localStorage.getItem(keyOf(dataset))
     if (!raw) return emptyEdits()
     const o = JSON.parse(raw) as Partial<UserEdits>
     if (!Array.isArray(o.added) || !Array.isArray(o.deleted)) return emptyEdits()
@@ -27,17 +29,17 @@ export function loadEdits(): UserEdits {
   }
 }
 
-export function saveEdits(e: UserEdits) {
+export function saveEdits(dataset: DatasetId, e: UserEdits) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(e))
+    localStorage.setItem(keyOf(dataset), JSON.stringify(e))
   } catch {
     // 存不下就算了：本次会话内的编辑仍然生效
   }
 }
 
-export function clearEdits() {
+export function clearEdits(dataset: DatasetId) {
   try {
-    localStorage.removeItem(KEY)
+    localStorage.removeItem(keyOf(dataset))
   } catch { /* 同上 */ }
 }
 

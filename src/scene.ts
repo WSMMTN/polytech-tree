@@ -1,10 +1,5 @@
 import * as THREE from 'three'
-import { CATEGORY_HEX } from './data'
 import { startViewDistance } from './layout'
-
-// 领域颜色（以 data/categories.json 为准，UI 图例与此一致）
-export { CATEGORY_HEX }
-export const CATEGORY_COLORS = CATEGORY_HEX.map(h => new THREE.Color(h))
 
 export function createScene(towerHeight: number, eraRadii: number[] = []): {
   scene: THREE.Scene

@@ -13,10 +13,10 @@
   <title>人类科技树 · 3D 世界</title>
 </head>
 <body>
-  <div id="app"><div id="loading">正在加载人类科技树…</div></div>
+  <div id="app"><div id="loading">正在加载科技树…</div></div>
 
   <div id="title" class="panel">
-    <h1>人类科技树</h1>
+    <h1 id="treeTitle">人类科技树</h1>
     <small id="statLine"></small>
   </div>
 
@@ -28,6 +28,8 @@
   <div id="legend" class="panel"></div>
 
   <div id="toolbar" class="panel">
+    <!-- 数据集切换：两棵树共用同一套渲染管线，按钮由 main.ts 依 DATASETS 生成 -->
+    <div id="dsSwitch"></div>
     <button id="btnTour">▶ 漫游动画</button>
     <button id="btnReset">⟲ 重置视角</button>
     <button id="btnEdit">✎ 编辑</button>

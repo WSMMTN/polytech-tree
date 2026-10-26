@@ -261,6 +261,20 @@ body {
   color: #fff;
 }
 
+/* 数据集切换：分段控件，当前那棵树高亮（.active 复用上面的样式） */
+#toolbar #dsSwitch {
+  display: flex;
+  gap: 4px;
+  padding-right: 10px;
+  border-right: 1px solid var(--line);
+}
+#toolbar #dsSwitch .ds-btn {
+  padding: 7px 12px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+#toolbar #dsSwitch .ds-btn.active { opacity: 1; }
+
 #hint {
   position: fixed;
   bottom: 20px;
@@ -398,6 +412,9 @@ body {
   #hint { display: none; }
   #eraCaption { font-size: 26px; letter-spacing: 6px; }
   #credit { font-size: 9px; max-width: 200px; right: 10px; bottom: 10px; }
+  /* 小屏工具栏放不下：切换控件独占一行，其余按钮折行居中 */
+  #toolbar { flex-wrap: wrap; justify-content: center; gap: 6px; max-width: calc(100vw - 24px); }
+  #toolbar #dsSwitch { width: 100%; justify-content: center; padding-right: 0; border-right: none; }
   #tooltip.pinned {
     left: 10px !important;
     right: 10px;

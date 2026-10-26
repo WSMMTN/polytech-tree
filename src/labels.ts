@@ -172,10 +172,12 @@ export function setLabelMinPxAll(px: number) {
 // ───── 科技名称图集（shelf pack：行式排布，条目宽度随文字长度变化） ─────
 
 const PAGE_W = 4096 // 图集页宽（像素）
-const LINE_H = 112  // 行高（像素）
-const FONT_PX = 88  // 字号（文字占行高 79%，避免 mipmap 后过细）
+const LINE_H = 56   // 行高（像素）：显示端上限 28px（DPR 1.5 时 42px 物理），56px 仍有过采样余量；
+                    // 曾经 112px 是 4 倍过采样，名称图集总量翻倍（数百 MB），是重建首帧触发
+                    // iGPU 驱动重置（Context Lost）的主因
+const FONT_PX = 44  // 字号（文字占行高 79%，避免 mipmap 后过细）
 const PAD_X = 26    // 条目左右留白（像素）
-const MAX_LINES = 32 // 每页最多行数（高度上限 3584px）
+const MAX_LINES = 64 // 每页最多行数（高度上限 3584px）
 
 const NAME_FONT = `bold ${FONT_PX}px "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif`
 
@@ -225,7 +227,7 @@ function buildNameAtlas(names: string[]): { pages: AtlasPage[]; slots: NameSlot[
       if (s.page !== p) continue
       const cx = s.x + s.w / 2
       const cy = s.y + LINE_H / 2
-      ctx.lineWidth = 12
+      ctx.lineWidth = 6 // 随行高减半，描边同步减细
       ctx.strokeStyle = 'rgba(0,0,0,0.92)'
       ctx.strokeText(names[i], cx, cy)
       ctx.fillStyle = '#ffffff'
@@ -241,6 +243,8 @@ function buildNameAtlas(names: string[]): { pages: AtlasPage[]; slots: NameSlot[
  *  update 按到相机距离只保留最近的 limit 个名称 */
 export function buildNameLabels(placed: PlacedNode[]): {
   meshes: THREE.Mesh[]
+  /** 名称图集页纹理：分帧预上传用（重建首帧一次性上传数百 MB 会触发 iGPU 驱动重置） */
+  pageTextures: THREE.Texture[]
   update: (camera: THREE.PerspectiveCamera, limit: number, viewportW: number, viewportH: number) => void
   /** 漫游：只点亮刚显现的科技名（带淡出 alpha） */
   setTourNames: (count: number, idx: Int32Array, alpha: Float32Array) => void
@@ -382,8 +386,8 @@ export function buildNameLabels(placed: PlacedNode[]): {
 
   return {
     meshes,
+    pageTextures: pages.map(p => p.texture),
     update,
-    /** 漫游：只点亮"刚显现的少数名称"并带上淡出 alpha，跳过屏内最近 N 个的名额逻辑 */
     setTourNames: (count: number, idx: Int32Array, alpha: Float32Array) => {
       visAttrs.forEach(a => (a.array as Float32Array).fill(0))
       for (let k = 0; k < count; k++) {
@@ -411,6 +415,8 @@ export function buildNameLabels(placed: PlacedNode[]): {
  *  每个字符作为 billboard 始终正对相机 → 文字"刻"在环上，不遮挡中间节点 */
 export function buildEraLabels(eraRadii: number[], eraY: number[]): {
   meshes: THREE.Mesh[]
+  /** 字符图集纹理：分帧预上传用（见 buildNameLabels.pageTextures） */
+  texture: THREE.Texture
   update: () => void
   /** 漫游：只显示已到达时代（含当前层）的时代名；传 -1 恢复全部 */
   setVisibleThrough: (era: number) => void
@@ -506,6 +512,7 @@ export function buildEraLabels(eraRadii: number[], eraY: number[]): {
 
   return {
     meshes,
+    texture: tex,
     update,
     setVisibleThrough: (era: number) => {
       const a = visAttr.array as Float32Array

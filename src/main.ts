@@ -1,11 +1,11 @@
 import './style.css'
 import * as THREE from 'three'
-import { TECHS, ERA_INFO, ERA_COUNT, CATEGORY_NAMES, CATEGORY_COUNT, CATEGORY_HEX, CATEGORY_GROUPS, GROUP_NAMES, YEAR_BASIS_LABEL } from './data'
-import type { TechNode } from './data'
+import { TECHS, ERA_INFO, ERA_COUNT, CATEGORY_NAMES, CATEGORY_COUNT, CATEGORY_HEX, CATEGORY_GROUPS, GROUPS, GROUP_NAMES, KIND_ORDER, ACTIVE_DATASET, DATASETS, DEFAULT_DATASET_ID, setActiveDataset } from './data'
+import type { TechNode, DatasetId } from './data'
 import { layoutTower, type PlacedNode } from './layout'
 import { createScene } from './scene'
 import { PolyhedraField, facesOf } from './polyhedra'
-import { buildEdges, buildEraRings } from './edges'
+import { buildEdges, buildEraRings, warmEdgeProgram } from './edges'
 import { buildNameLabels, buildEraLabels, updateLabelFocal, setLabelMinPxAll } from './labels'
 import { CameraRig } from './controls'
 import { TourPlan, BLEND } from './tour'
@@ -16,8 +16,17 @@ import { COMMUNITY_ENABLED } from './community/config'
 // 点击聚焦沿"画面上真实存在的弧线"走 1 跳：只留直接相连的上下游，配合相机取景把这一组放到画面里
 const FOCUS_HOPS = 1
 
-// ───── 世界状态：数据（基础 + 用户增删）→ 布局 → 场景内容。增删后由 rebuildWorld() 整体重建 ─────
-let edits: UserEdits = loadEdits()
+// ───── 数据集：两棵树共用同一套渲染管线，这里只记"当前是哪一套" ─────
+/** 初始数据集取自 URL hash 的 ds 参数；未知值退回默认（人类树，老分享链接无 ds 也能用） */
+function datasetFromHash(): DatasetId {
+  const id = new URLSearchParams(location.hash.slice(1)).get('ds')
+  return id && DATASETS.some(d => d.id === id) ? (id as DatasetId) : DEFAULT_DATASET_ID
+}
+let datasetId: DatasetId = datasetFromHash()
+setActiveDataset(datasetId) // 必须早于 buildWorld() 与任何布局/UI 读取
+
+// ───── 世界状态：数据（基础 + 用户增删）→ 布局 → 场景内容。增删后由 rebuildAfterDataChange() 整体重建 ─────
+let edits: UserEdits = loadEdits(datasetId)
 // 社区层（Supabase）。未配置后端时 COMMUNITY_ENABLED=false，相关调用全部短路，
 // 行为与纯本地版本完全一致
 let communityEdits: UserEdits = emptyEdits()
@@ -61,13 +70,52 @@ if (IS_TOUCH) {
 // ───── 场景（只建一次；里面的世界内容由 buildWorld 负责换血） ─────
 const { scene, camera, renderer } = createScene(0)
 
+// 连线程序预热：趁上下文还新鲜、场景还只有星空和网格（渲染成本可忽略），
+// 先完成编译与首次使用校验，避开后面重帧（全量上传约四千个标签贴图）里
+// 可能的驱动重置窗口
+try { warmEdgeProgram(renderer, scene, camera) } catch { /* 上下文异常时静默，后续渲染自会重试 */ }
+
+// ───── GPU 上下文丢失保护：iGPU 内存吃紧时驱动可能回收上下文 ─────
+// 丢失期间跳过绘制（此时任何 GL 调用都是无效的）；恢复后 three 会自动重建
+// 内部资源缓存并重新上传，这里只需把标签可见集重算一遍。
+let glLost = false
+// 构建/分帧上传期间为 false：渲染循环挂起，避免首帧一次性吞下全部资源上传
+// （声明在文件顶部：首屏 buildWorld 之后就要用到）
+let worldReady = true
+// WEBGL_lose_context：丢失后主动请求恢复。多数浏览器在恢复就绪时会自动派发
+// restored 事件，但个别驱动/环境里事件缺席会让页面永久白屏 —— 兜底调用幂等无害
+const loseCtxExt = renderer.getContext().getExtension('WEBGL_lose_context') as WEBGL_lose_context | null
+renderer.domElement.addEventListener('webglcontextlost', () => {
+  glLost = true
+  loseCtxExt?.restoreContext()
+})
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  glLost = false
+  nameLabels.invalidate()
+  // 恢复后 three 的资源登记表已清空，纹理/程序全部待重建。若直接恢复绘制，
+  // 首帧会同时吞下全部重传与程序重编译——恰逢驱动恢复初期不稳，校验会刷出
+  // 一段 Shader Error，还可能再次触发重置。改为：等驱动稳定 → 显式分帧重传
+  // 贴图 → 集中一帧完成程序重编译与校验 → 再恢复绘制
+  void recoverAfterRestore()
+})
+
+/** 上下文恢复后的重建流程（见 restored 监听器注释） */
+async function recoverAfterRestore() {
+  worldReady = false
+  await nextFrames(3) // 给驱动彻底稳定的时间窗
+  await uploadTexturesPerFrame()
+  renderer.render(scene, camera) // 集中完成程序重编译与首用校验
+  worldReady = true
+}
+
 /** 释放上一套世界内容。注意多面体几何是模块级共享的，不能跟着一起销毁 */
-function disposeObjects(objs: THREE.Object3D[], disposeGeometry = true) {
+function disposeObjects(objs: THREE.Object3D[], disposeGeometry = true, disposeMaterial = true) {
   for (const o of objs) {
     o.parent?.remove(o)
     o.traverse(c => {
       const m = c as THREE.Mesh
       if (disposeGeometry && m.geometry) m.geometry.dispose()
+      if (!disposeMaterial) return
       const mats = Array.isArray(m.material) ? m.material : m.material ? [m.material] : []
       for (const mat of mats) {
         // 名称/时代名的贴图是每套世界现画的 canvas 纹理，必须一并释放
@@ -97,15 +145,25 @@ function combineOverlay(local: UserEdits, remote: UserEdits): UserEdits {
 }
 
 /**
- * 按当前 techs 重建全部世界内容：布局、依赖图、多面体、环、名称、时代名、连线、漫游排期。
- * 新增/删除节点后调用，是"数据变了画面就跟着变"的唯一入口。
+ * 摘掉并释放当前世界内容的 GPU 资源。可单独调用（切换数据集时先拆旧、
+ * 让出一帧再建新），也可经 buildWorld 间接调用（增删节点后原地重建）。
  */
-function buildWorld() {
+function disposeWorld() {
   disposeObjects(field ? field.meshes : [], false)
   disposeObjects(rings)
   disposeObjects(nameLabels ? nameLabels.meshes : [])
   disposeObjects(eraLabels ? eraLabels.meshes : [])
-  if (edges) disposeObjects([edges.lines])
+  // 连线材质是全局共享的（见 edges.ts），只弃几何体，别把编译好的程序一起丢了
+  if (edges) disposeObjects([edges.lines], true, false)
+  rings = []
+}
+
+/**
+ * 按当前 techs 重建全部世界内容：布局、依赖图、多面体、环、名称、时代名、连线、漫游排期。
+ * 新增/删除节点后调用，是"数据变了画面就跟着变"的唯一入口。
+ */
+function buildWorld() {
+  disposeWorld()
 
   techs = applyEdits(TECHS, combineOverlay(edits, communityEdits))
   const layout = layoutTower(techs)
@@ -144,24 +202,34 @@ function buildWorld() {
 }
 
 buildWorld()
+// 首屏同样分帧上传：挂起渲染循环，把标签图集逐张传完再开始绘制（见 rebuildSpread 注释）
+worldReady = false
+void uploadTexturesPerFrame().then(() => { worldReady = true })
 const rig = new CameraRig(camera, renderer.domElement, eraRadii, towerHeight, plan)
 
 // ───── UI：图例（领域可隐藏）+ 名称显示上限 ─────
 const legend = document.getElementById('legend')!
 let labelLimit = 100 // 名称显示上限；图例里的滑杆会改它
 const IMPLbl = ['基石', '领域支柱', '领域内重要', '改良与细分', '长尾补充']
-const KINDS = ['原理', '工艺', '器物', '制度', '媒介'] as const
+
+/** 域群 → 该组下的领域索引。随数据集变化（群星树没有 A 组），故每次重建图例时重算 */
+let CATS_BY_GROUP: Record<string, number[]> = {}
+function rebuildCatsByGroup() {
+  CATS_BY_GROUP = Object.fromEntries(
+    GROUPS.map(g => [g.key, CATEGORY_NAMES.map((_, i) => i).filter(i => CATEGORY_GROUPS[i] === g.key)]))
+}
 
 /** 图例整块重建：领域与重要度的计数随增删变化，不能只写死一次 */
 function buildLegend() {
+  rebuildCatsByGroup()
   const catCount = CATEGORY_NAMES.map((_, i) => placed.filter(p => p.node.category === i).length)
   legend.innerHTML = `
   <div class="lg-head"><div class="lg-title">领域图例</div>
     <button class="lg-toggle" id="legendToggle" title="折叠/展开图例">${legend.classList.contains('collapsed') ? '▸' : '▾'}</button></div>
   <div class="lg-body">
-  ${['A', 'B', 'C', 'D'].map(g => `
-    <button class="lg-group" data-group="${g}" title="整组开关：组内有隐藏时全显，否则全隐">${GROUP_NAMES[g]}<i>▾</i></button>
-    ${CATEGORY_NAMES.map((name, i) => CATEGORY_GROUPS[i] === g ? `
+  ${GROUPS.map(g => `
+    <button class="lg-group" data-group="${g.key}" title="整组开关：组内有隐藏时全显，否则全隐">${GROUP_NAMES[g.key]}<i>▾</i></button>
+    ${CATEGORY_NAMES.map((name, i) => CATEGORY_GROUPS[i] === g.key ? `
       <button class="lg-item lg-cat" data-cat="${i}" title="点击隐藏该领域（含其连线），再点恢复">
         <span class="lg-dot" style="background:${CATEGORY_HEX[i]};color:${CATEGORY_HEX[i]}"></span><span>${name}</span><b>${catCount[i]}</b>
       </button>` : '').join('')}`).join('')}
@@ -184,7 +252,7 @@ function buildLegend() {
   <div class="lg-sep"></div>
   <div class="lg-title">副轴 kind（规范 §3：筛选与文案）</div>
   <div class="lg-kinds" id="kindFilter">
-  ${KINDS.map(k => `<button class="lg-kind" data-kind="${k}">${k}<b>${placed.filter(p => p.node.kind === k).length}</b></button>`).join('')}
+  ${KIND_ORDER.map(k => `<button class="lg-kind" data-kind="${k}">${k}<b>${placed.filter(p => p.node.kind === k).length}</b></button>`).join('')}
   </div>
   <div class="lg-hint">点选即筛选：隐去节点、连线与名称，不动位置</div>
   </div>
@@ -203,12 +271,6 @@ const activeKinds = new Set<string>()
 let soloImp: number | null = null // 独显某档重要度（null = 不限档）
 const isVisible = (i: number) => nodeVis[i] > 0
 
-// 域群 → 该组下的领域索引。键必须是 categories.json 的组字母（A/B/C/D），
-// 图例的 data-group 用的就是这个字母
-const CATS_BY_GROUP: Record<string, number[]> = Object.fromEntries(
-  ['A', 'B', 'C', 'D'].map(g =>
-    [g, CATEGORY_NAMES.map((_, i) => i).filter(i => CATEGORY_GROUPS[i] === g)]))
-
 function syncPanelState() {
   legend.querySelectorAll('.lg-cat').forEach(el =>
     el.classList.toggle('off', hiddenCats.has(Number((el as HTMLElement).dataset.cat))))
@@ -226,9 +288,10 @@ function syncPanelState() {
     el.classList.toggle('on', activeKinds.has((el as HTMLElement).dataset.kind!)))
 }
 
-// ───── URL hash 状态：#n=<id>&hide=<领域>&imp=<档>&k=<kind>，当前视图可直接分享 ─────
+// ───── URL hash 状态：#ds=<数据集>&n=<id>&hide=<领域>&imp=<档>&k=<kind>，当前视图可直接分享 ─────
 function syncHash() {
   const p = new URLSearchParams()
+  p.set('ds', datasetId)
   if (selected !== null) p.set('n', placed[selected].node.id)
   if (hiddenCats.size) p.set('hide', [...hiddenCats].sort((a, b) => a - b).join(','))
   if (soloImp !== null) p.set('imp', String(soloImp))
@@ -237,7 +300,7 @@ function syncHash() {
   history.replaceState(null, '', s ? `#${s}` : location.pathname + location.search)
 }
 
-/** 从 URL hash 恢复筛选与聚焦，返回 hash 指定的节点索引（无则 null） */
+/** 从 URL hash 恢复筛选与聚焦，返回 hash 指定的节点索引（无则 null）。ds 已在启动时单独处理 */
 function restoreFromHash(): number | null {
   const h = new URLSearchParams(location.hash.slice(1))
   h.get('hide')?.split(',').forEach(s => {
@@ -247,7 +310,7 @@ function restoreFromHash(): number | null {
   const imp = Number(h.get('imp'))
   if (imp >= 1 && imp <= 5) soloImp = imp
   h.get('k')?.split(',').forEach(k => {
-    if ((KINDS as readonly string[]).includes(k)) activeKinds.add(k)
+    if (KIND_ORDER.includes(k)) activeKinds.add(k)
   })
   const nid = h.get('n')
   return nid ? placedByIdx.get(nid) ?? null : null
@@ -321,7 +384,9 @@ let captionTimer = 0
 rig.onEraChange = era => {
   const info = ERA_INFO[era]
   const win = plan.windows[era]
-  caption.innerHTML = `${info.name}<span class="sub">${info.range} · ${win.count} 项</span>`
+  // 群星树的"层级"没有年代区间，只留项数
+  const sub = [info.range, `${win.count} 项`].filter(Boolean).join(' · ')
+  caption.innerHTML = `${esc(info.name)}<span class="sub">${sub}</span>`
   caption.classList.add('show')
   clearTimeout(captionTimer)
   // 只停留到本时代窗口过半，把画面让给正在显现的科技名
@@ -332,6 +397,15 @@ rig.onEraChange = era => {
 const btnTour = document.getElementById('btnTour') as HTMLButtonElement
 const btnReset = document.getElementById('btnReset') as HTMLButtonElement
 const btnCommunity = document.getElementById('btnCommunity') as HTMLButtonElement
+
+// ───── UI：数据集切换（两棵树随时切换） ─────
+const dsSwitch = document.getElementById('dsSwitch')!
+dsSwitch.innerHTML = DATASETS.map(d =>
+  `<button class="ds-btn" data-ds="${d.id}" title="切换到${d.label}">${d.label}</button>`).join('')
+dsSwitch.addEventListener('click', e => {
+  const el = (e.target as HTMLElement).closest('.ds-btn') as HTMLElement | null
+  if (el) void applyDataset(el.dataset.ds as DatasetId)
+})
 
 // ───── 社区层开关：一键隐藏 / 显示社区贡献的节点（连带其连线与名称） ─────
 /** 没有社区节点时整颗按钮不出现，纯本地版本不会多出一个永远点不动的按钮 */
@@ -505,16 +579,6 @@ const tooltip = document.getElementById('tooltip')!
 const raycaster = new THREE.Raycaster()
 const ndc = new THREE.Vector2()
 
-// 规范 §6：tooltip 同时显示"精确数值"与"真实精度"，避免把约定值读成确证
-function yearText(n: TechNode): string {
-  const b = YEAR_BASIS_LABEL[n.yearBasis] ?? { mark: '', approx: false }
-  const abs = Math.abs(n.year)
-  const core = n.year >= 0
-    ? `${n.year} 年`
-    : abs >= 10000 ? `前 ${(abs / 10000).toFixed(abs % 10000 === 0 ? 0 : 1)} 万年` : `公元前 ${abs} 年`
-  return `${b.approx ? '约' : ''}${core}${b.mark ? `（${b.mark}）` : ''}`
-}
-
 function pickAt(clientX: number, clientY: number): number | null {
   const rect = renderer.domElement.getBoundingClientRect()
   ndc.set(
@@ -570,13 +634,14 @@ function tooltipHTML(idx: number, pinned: boolean): string {
     : ''
   return `
     <div class="tt-name">${esc(n.name)}${communityIds.has(n.id) ? '<span class="tt-comm">社区</span>' : ''}</div>
-    <div class="tt-dim">${n.nameEn !== n.name ? esc(n.nameEn) + ' · ' : ''}${yearText(n)}</div>
+    <div class="tt-dim">${n.nameEn !== n.name ? esc(n.nameEn) + ' · ' : ''}${ACTIVE_DATASET.formatYear(n)}</div>
     <div class="tt-dim">${ERA_INFO[n.era].name} · ${CATEGORY_NAMES[n.category]}${n.kind ? ' · ' + esc(n.kind) : ''}</div>
     <div class="tt-dim">重要度 ${'★'.repeat(6 - n.importance)}${'☆'.repeat(n.importance - 1)}　${facesOf(n.importance)} 面</div>
     ${prereqNames ? `<div class="tt-dim">前置：${prereqNames}</div>` : ''}
     ${n.desc ? `<div class="tt-desc">${esc(n.desc)}</div>` : ''}
+    ${ACTIVE_DATASET.extraTooltip(n)}
     ${link}
-    ${n.wikiEn
+    ${ACTIVE_DATASET.showWiki && n.wikiEn
       ? `<div class="tt-src">摘要参考英文维基百科条目
           <a href="https://en.wikipedia.org/wiki/${encodeURIComponent(n.wikiEn)}" target="_blank" rel="noopener">${esc(n.wikiEn)}</a>
           （CC BY-SA 4.0）</div>`
@@ -706,12 +771,16 @@ const edColorAuto = document.getElementById('edColorAuto') as HTMLInputElement
 const edDesc = document.getElementById('edDesc') as HTMLTextAreaElement
 const edCount = document.getElementById('edCount')!
 
-edEra.innerHTML = ERA_INFO.map((e, i) => `<option value="${i}">${e.name}</option>`).join('')
-edCat.innerHTML = CATEGORY_NAMES.map((n, i) => `<option value="${i}">${n}</option>`).join('')
-edKind.innerHTML = `<option value="">（未指定）</option>` +
-  KINDS.map(k => `<option value="${k}">${k}</option>`).join('')
-edImp.innerHTML = [1, 2, 3, 4, 5].map(l =>
-  `<option value="${l}"${l === 3 ? ' selected' : ''}>${l} · ${facesOf(l)} 面 ${IMPLbl[l - 1]}</option>`).join('')
+/** 编辑面板的下拉项随数据集重建（时代的名字/数量、领域列表、kind 列表都不一样） */
+function fillEditSelects() {
+  edEra.innerHTML = ERA_INFO.map((e, i) => `<option value="${i}">${esc(e.name)}</option>`).join('')
+  edCat.innerHTML = CATEGORY_NAMES.map((n, i) => `<option value="${i}">${esc(n)}</option>`).join('')
+  edKind.innerHTML = `<option value="">（未指定）</option>` +
+    KIND_ORDER.map(k => `<option value="${k}">${k}</option>`).join('')
+  edImp.innerHTML = [1, 2, 3, 4, 5].map(l =>
+    `<option value="${l}"${l === 3 ? ' selected' : ''}>${l} · ${facesOf(l)} 面 ${IMPLbl[l - 1]}</option>`).join('')
+  syncColorPreview()
+}
 
 // ───── 前置科技：近四千项不适合下拉框，改成"输入即过滤"的可搜索选择器 ─────
 // 索引懒建（首次输入时才展开全量），数据重建后置空等下次再建
@@ -817,7 +886,7 @@ syncColorPreview()
 function setNodeColor(id: string, hex: string | null) {
   if (hex) edits.colors[id] = hex
   else delete edits.colors[id]
-  saveEdits(edits)
+  saveEdits(datasetId, edits)
   if (communityApi) void communityApi.pushColor(id, hex) // 社区层同步记一笔
   const idx = placedByIdx.get(id)
   if (idx === undefined) return
@@ -860,10 +929,10 @@ function deleteNode(id: string) {
   }
   delete edits.colors[id] // 节点都没了，自定义色一并清掉
   if (prereqId === id) pickPrereq(null)
-  saveEdits(edits)
+  saveEdits(datasetId, edits)
   if (communityApi) void communityApi.pushDelete(id) // 社区层同步记一笔（核心节点会被服务端拒掉）
   hidePinnedTooltip()
-  rebuildAfterDataChange(null)
+  rebuildSpread(null)
 }
 
 document.getElementById('edAdd')!.addEventListener('click', () => {
@@ -892,7 +961,7 @@ document.getElementById('edAdd')!.addEventListener('click', () => {
   edits.added.push(node)
   // 自定义色与新增节点一样只记在叠加层：color 缺省即跟随领域
   if (!edColorAuto.checked) edits.colors[id] = edColor.value
-  saveEdits(edits)
+  saveEdits(datasetId, edits)
   if (communityApi) void communityApi.pushAdd(node) // 社区层同步记一笔
   edName.value = ''
   edNameEn.value = ''
@@ -900,21 +969,22 @@ document.getElementById('edAdd')!.addEventListener('click', () => {
   edColorAuto.checked = true
   syncColorPreview()
   pickPrereq(null)
-  rebuildAfterDataChange(id) // 重建后把相机飞到新节点，立刻看到它落在哪
+  rebuildSpread(id) // 重建后把相机飞到新节点，立刻看到它落在哪
 })
 
 document.getElementById('edRestore')!.addEventListener('click', () => {
   if (!hasEdits(edits)) return
   edits = emptyEdits()
-  clearEdits()
-  rebuildAfterDataChange(null)
+  clearEdits(datasetId)
+  rebuildSpread(null)
 })
 
 /** 界面里随数据变化的那些计数与索引 */
 function refreshInterface() {
   document.getElementById('statLine')!.textContent =
-    `${techs.length} 项科技 · ${ERA_COUNT} 个时代 · ${CATEGORY_COUNT} 大领域`
+    `${techs.length} 项科技 · ${ERA_COUNT} 个${ACTIVE_DATASET.eraNoun} · ${CATEGORY_COUNT} 大领域`
   buildLegend()
+  fillEditSelects()
   buildSearchIndex()
   markPrereqDirty()
   edCount.textContent = hasEdits(edits)
@@ -922,6 +992,7 @@ function refreshInterface() {
     : '当前为调研原始数据'
   edCount.classList.toggle('dirty', hasEdits(edits))
   syncCommunityButton()
+  updateBrand()
 }
 
 /** 增删之后：重建世界 → 让相机认新布局 → 清残留状态 → 重新下发掩码 */
@@ -946,6 +1017,77 @@ function rebuildAfterDataChange(focusId: string | null) {
   }
 }
 
+/** 标题 / 页脚署名 / 切换按钮高亮随当前数据集走 */
+function updateBrand() {
+  const ds = ACTIVE_DATASET
+  document.getElementById('treeTitle')!.textContent = ds.title
+  document.getElementById('credit')!.innerHTML = ds.attribution
+  document.title = `${ds.title} · 3D 世界`
+  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', ds.title)
+  dsSwitch.querySelectorAll('.ds-btn').forEach(el =>
+    el.classList.toggle('active', (el as HTMLElement).dataset.ds === datasetId))
+}
+
+/** 让出 n 帧：给驱动留出真正回收旧资源的时间窗，再开始分配新世界 */
+const nextFrames = (n: number) => new Promise<void>(r => {
+  const step = () => (--n > 0 ? requestAnimationFrame(step) : r())
+  requestAnimationFrame(step)
+})
+
+// ───── 重建后的分帧上传：治本"切回大树触发驱动重置" ─────
+// 重建首帧若一次性上传全部 GPU 资源（名称图集约 7 页 × 32MB、时代字符图集、
+// 全部几何），单帧提交过重会触发 iGPU 驱动重置（Context Lost），并连带刷出
+// 一段"恢复期程序首用校验失败"的 Shader Error。因此构建完成后挂起渲染循环，
+// 用 initTexture 逐张预上传，每张之间让出一帧，全部传完再恢复绘制。
+
+/** 把当前世界的贴图逐张预上传，每张之间让一帧。依赖 nameLabels/eraLabels 已就位 */
+async function uploadTexturesPerFrame() {
+  const texs: THREE.Texture[] = [
+    ...(nameLabels ? nameLabels.pageTextures : []),
+    ...(eraLabels ? [eraLabels.texture] : []),
+  ]
+  for (const t of texs) {
+    renderer.initTexture(t)
+    await nextFrames(1)
+  }
+}
+
+/** 重建世界的完整流程：CPU 构建 → 挂起渲染 → 分帧上传 → 恢复绘制 */
+function rebuildSpread(focusId: string | null) {
+  worldReady = false
+  rebuildAfterDataChange(focusId)
+  void uploadTexturesPerFrame().then(() => { worldReady = true })
+}
+
+/**
+ * 切换数据集：先换数据（活绑定整体重绑），再复用"数据变了"的重建路径把世界换成新树。
+ * 筛选状态与选中一律清空 —— 领域/时代的索引空间不同，旧索引在新树里没有意义。
+ */
+async function applyDataset(id: DatasetId) {
+  if (id === datasetId) return
+  if (rig.mode === 'tour') rig.stopTour()
+  datasetId = id
+  setActiveDataset(id) // 必须先于 buildWorld()，布局与图例都读这批活绑定
+  hiddenCats.clear()
+  activeKinds.clear()
+  soloImp = null
+  hoverIdx = null
+  caption.classList.remove('show')
+  // 编辑叠加层按数据集分开存：人类树的 era/category 索引不能套到群星树上
+  edits = loadEdits(id)
+  // 社区层目前按人类树的数据编目（后端无数据集列），切换时先清空，避免索引错配
+  communityEdits = emptyEdits()
+  communityIds = new Set()
+  communityNodeIds = new Set()
+  // 拆旧与建新分帧走：同帧"弃旧迎新"会让一次提交里同时经历大批资源删除与创建，
+  // iGPU 上可能触发驱动重置（Context Lost）。空档帧画面为空，肉眼不可察；
+  // 建新走 rebuildSpread，把数百 MB 的贴图上传摊到多帧（见 rebuildSpread 注释）
+  disposeWorld()
+  await nextFrames(3)
+  rebuildSpread(null)
+  syncHash()
+}
+
 // ───── 社区层接线（Supabase）─────
 // 只有配好 src/community/config.ts 里的 URL + anon key 才会真正加载 src/community；
 // 没配时 COMMUNITY_ENABLED=false，communityApi 恒为 null，所有上报/订阅都是空操作。
@@ -958,7 +1100,7 @@ async function refreshCommunity() {
   communityEdits = st.edits
   communityIds = st.communityIds
   communityNodeIds = st.nodeIds
-  rebuildAfterDataChange(null)
+  rebuildSpread(null)
 }
 
 async function loadCommunity() {
@@ -999,8 +1141,21 @@ if (hashSelected !== null) {
 applyVisualState() // 若 hash 所选节点被 hash 里的筛选隐去，会在这里自动解除聚焦
 if (selected !== null) focusCamera(selected)
 
+// 手改地址栏 / 粘贴分享链接导致 hash 变化时跟随切换数据集。
+// syncHash() 走 history.replaceState，不会触发 hashchange，故不存在自触发循环
+window.addEventListener('hashchange', () => {
+  const id = datasetFromHash()
+  if (id !== datasetId) void applyDataset(id)
+})
+
 function loop() {
   requestAnimationFrame(loop)
+  if (glLost || !worldReady) {
+    // 上下文被驱动回收：跳过本帧，等 restore 事件后 three 自动重传资源
+    // worldReady=false：构建/分帧上传期间不上屏，避免首帧一次性吞下全部上传
+    clock.getDelta() // 丢弃挂起期间累积的时钟增量，恢复时从零起算
+    return
+  }
   const dt = Math.min(clock.getDelta(), 0.1)
   const time = clock.elapsedTime
 

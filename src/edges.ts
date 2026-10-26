@@ -1,12 +1,53 @@
 import * as THREE from 'three'
 import type { PlacedNode } from './layout'
-import { CATEGORY_COLORS } from './scene'
-import { ERA_COUNT } from './data'
+import { CATEGORY_HEX, ERA_COUNT } from './data'
 
 const SEG = 4 // 每条弧线的分段数（原 8：减半顶点，弧线仍足够平滑）
 const GROW_MAX = 1.6 // 单条边可见爬行的最长时长（秒）
 const OPACITY = 0.3        // 常态：四千多条线同时要看得见，单条只能压得很低
 const FOCUS_OPACITY = 0.62 // 聚焦时只剩子图那几十条，抬上来才读得出因果走向
+
+// 连线材质全应用共享一份：GL 程序只在首帧编译一次，之后无论增删节点还是切换
+// 数据集都不再有编译与校验。旧实现每次重建都新建 ShaderMaterial，而材质 dispose
+// 会把已编译的程序逐出缓存 —— 实测在 iGPU 上切回大树时，新程序首次使用期间恰逢
+// 驱动重置（Context Lost），控制台刷出一段吓人但无害的 Shader Error。
+// uniforms 只有 uOpacity，且 setEmphasis 每次重建后都会重设绝对值，复用无状态残留。
+let sharedMaterial: THREE.ShaderMaterial | null = null
+function edgeMaterial(): THREE.ShaderMaterial {
+  if (!sharedMaterial) {
+    sharedMaterial = new THREE.ShaderMaterial({
+      uniforms: { uOpacity: { value: OPACITY } },
+      vertexShader: VERT,
+      fragmentShader: FRAG,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    })
+  }
+  return sharedMaterial
+}
+
+/**
+ * 连线程序预热：three 把着色器诊断挂在程序第一次被渲染使用时（getUniforms），
+ * 若那一刻恰好是首帧/重建后的全量上传重帧、驱动又正在重置上下文（iGPU 临界态
+ * 偶发），就会顺带刷出一段空 Info Log 的 Shader Error。
+ *
+ * 必须在真实的 scene / camera / 画布里做（buildWorld 之前场景还只有星空和网格，
+ * 渲染成本可忽略）：program cache key 含雾与灯光等场景状态，用临时迷你场景
+ * 编译出来的程序和真实渲染需要的不是同一个，预热就白做了。画布首帧会被整体
+ * 清除，不留痕迹。启动时调用一次，之后程序常驻缓存。
+ */
+export function warmEdgeProgram(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera) {
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0], 3))
+  geo.setAttribute('aColor', new THREE.Float32BufferAttribute([1, 1, 1, 1, 1, 1], 3))
+  geo.setAttribute('aAlpha', new THREE.Float32BufferAttribute([1, 1], 1))
+  const probe = new THREE.LineSegments(geo, edgeMaterial())
+  scene.add(probe)
+  renderer.render(scene, camera)
+  scene.remove(probe)
+  geo.dispose()
+}
 
 const VERT = `
 attribute vec3 aColor;
@@ -58,6 +99,10 @@ export function buildEdges(placed: PlacedNode[], revealAt: Float32Array): {
   const idxById = new Map(placed.map((p, i) => [p.node.id, i]))
   const byId = new Map(placed.map(p => [p.node.id, p]))
 
+  // 领域色：按当前数据集就地构建。不能做成模块级常量 —— 切换数据集后 CATEGORY_HEX
+  // 会整体换血，而常量只算一次，会残留上一棵树的颜色
+  const catColors = CATEGORY_HEX.map(h => new THREE.Color(h))
+
   const positions: number[] = []
   const colors: number[] = []
   const recs: EdgeRec[] = []
@@ -82,7 +127,7 @@ export function buildEdges(placed: PlacedNode[], revealAt: Float32Array): {
       const bend = Math.min(8, p0.distanceTo(p1) * 0.12)
       ctrl.normalize().multiplyScalar(bend).add(mid)
 
-      const c = CATEGORY_COLORS[node.node.category].clone().multiplyScalar(0.5)
+      const c = catColors[node.node.category].clone().multiplyScalar(0.5)
       // 每条弧按 t 递增写入 8 段 → 缓冲顺序即"前置→当前"的生长顺序
       const base = positions.length / 3
       for (let s = 0; s < SEG; s++) {
@@ -106,14 +151,7 @@ export function buildEdges(placed: PlacedNode[], revealAt: Float32Array): {
   const alphaAttr = new THREE.BufferAttribute(alpha, 1)
   geo.setAttribute('aAlpha', alphaAttr)
 
-  const lines = new THREE.LineSegments(geo, new THREE.ShaderMaterial({
-    uniforms: { uOpacity: { value: 0.3 } },
-    vertexShader: VERT,
-    fragmentShader: FRAG,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  }))
+  const lines = new THREE.LineSegments(geo, edgeMaterial())
 
   // 0 = 未起笔，1 = 延伸中，2 = 已抵达。漫游时钟单调，故不需要回退
   const state = new Uint8Array(recs.length).fill(2)
