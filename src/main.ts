@@ -1028,11 +1028,16 @@ function updateBrand() {
     el.classList.toggle('active', (el as HTMLElement).dataset.ds === datasetId))
 }
 
-/** 让出 n 帧：给驱动留出真正回收旧资源的时间窗，再开始分配新世界 */
-const nextFrames = (n: number) => new Promise<void>(r => {
-  const step = () => (--n > 0 ? requestAnimationFrame(step) : r())
-  requestAnimationFrame(step)
-})
+/** 让出 n 帧：给驱动留出真正回收旧资源的时间窗，再开始分配新世界。
+ *  必须是 function 声明（而非 const 箭头函数）：模块顶层 buildWorld() 之后
+ *  立刻会调用它，此时文件后段才出现的 const 仍处于 TDZ，会抛
+ *  "Cannot access 'nextFrames' before initialization" 让 worldReady 永远停在 false。 */
+function nextFrames(n: number): Promise<void> {
+  return new Promise<void>(r => {
+    const step = () => (--n > 0 ? requestAnimationFrame(step) : r())
+    requestAnimationFrame(step)
+  })
+}
 
 // ───── 重建后的分帧上传：治本"切回大树触发驱动重置" ─────
 // 重建首帧若一次性上传全部 GPU 资源（名称图集约 7 页 × 32MB、时代字符图集、
@@ -1173,8 +1178,10 @@ function loop() {
     field.update(time)
     field.highlight(hoverIdx)
     nameLabels.update(camera, labelLimit, innerWidth, innerHeight)
-    renderer.render(scene, camera)
   }
   eraLabels.update()
+  // 漫游与环绕都要出图：此前误把 render 关进了环绕分支，导致点「漫游动画」后
+  // 相机在动、CPU 在算，画面却一帧都不重绘（表现为点了就卡住）
+  renderer.render(scene, camera)
 }
 loop()
